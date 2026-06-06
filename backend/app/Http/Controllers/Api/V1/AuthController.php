@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Api\V1;
 
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Auth\LoginRequest;
+use App\Http\Requests\Auth\RegisterRequest;
+use App\Models\Role;
 use App\Models\User;
 use App\Support\ApiResponse;
 use Illuminate\Http\JsonResponse;
@@ -44,6 +46,30 @@ class AuthController extends Controller
             'expires_at' => $expiresAt?->toIso8601String(),
             'user' => $this->authUserPayload($user),
         ], 'Login successful.');
+    }
+
+    public function register(RegisterRequest $request): JsonResponse
+    {
+        $data = $request->validated();
+        unset($data['password_confirmation']);
+
+        $user = User::query()->create($data);
+
+        $citizenRole = Role::query()->where('name', 'citizen')->firstOrFail();
+        $user->roles()->attach($citizenRole);
+
+        $expirationMinutes = config('sanctum.expiration');
+        $expiresAt = $expirationMinutes ? now()->addMinutes((int) $expirationMinutes) : null;
+        $token = $user->createToken('web-client', ['*'], $expiresAt);
+
+        $user->load('roles');
+
+        return ApiResponse::success([
+            'token_type' => 'Bearer',
+            'access_token' => $token->plainTextToken,
+            'expires_at' => $expiresAt?->toIso8601String(),
+            'user' => $this->authUserPayload($user),
+        ], 'Registration successful.', 201);
     }
 
     public function me(Request $request): JsonResponse

@@ -16,4 +16,9 @@ class RescueTeam extends Model
     {
         return $this->hasMany(Incident::class, 'assigned_team_id');
     }
+
+    public function members(): HasMany
+    {
+        return $this->hasMany(RescueTeamMember::class);
+    }
 }

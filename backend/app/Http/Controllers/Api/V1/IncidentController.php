@@ -10,6 +10,7 @@ use App\Http\Requests\Incident\UpdateIncidentRequest;
 use App\Http\Requests\Incident\UpdateIncidentStatusRequest;
 use App\Http\Resources\IncidentResource;
 use App\Models\Incident;
+use App\Models\IncidentMedia;
 use App\Services\IncidentService;
 use App\Support\ApiResponse;
 use Illuminate\Database\Eloquent\Builder;
@@ -122,6 +123,31 @@ class IncidentController extends Controller
         return ApiResponse::success([
             'incident' => new IncidentResource($incident),
         ], 'Incident status updated.');
+    }
+
+    public function uploadMedia(Request $request, Incident $incident): JsonResponse
+    {
+        $request->validate([
+            'file' => ['required', 'file', 'mimes:jpg,jpeg,png,gif,mp4,mov,webm', 'max:20480'],
+        ]);
+
+        $file = $request->file('file');
+        $path = $file->store('incident-media/' . $incident->id, 'public');
+
+        $media = IncidentMedia::query()->create([
+            'incident_id' => $incident->id,
+            'uploaded_by_user_id' => $request->user()?->id,
+            'disk' => 'public',
+            'path' => $path,
+            'original_name' => $file->getClientOriginalName(),
+            'mime_type' => $file->getMimeType(),
+            'size_bytes' => $file->getSize(),
+        ]);
+
+        return ApiResponse::success([
+            'media' => $media,
+            'url' => '/storage/' . $path,
+        ], 'Media uploaded.', 201);
     }
 
     /**

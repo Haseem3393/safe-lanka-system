@@ -79,4 +79,9 @@ class Incident extends Model
     {
         return $this->hasMany(IncidentStatusHistory::class);
     }
+
+    public function media(): HasMany
+    {
+        return $this->hasMany(IncidentMedia::class);
+    }
 }
