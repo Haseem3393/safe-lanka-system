@@ -1,22 +1,33 @@
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Activity, AlertTriangle, Ambulance, BarChart3, Bell, Building2, CheckCircle2,
-  Clock3, Crosshair, Home, Lock, LogIn, Mail, Map as MapIcon, MapPin, Navigation,
-  PhoneCall, Radio, Route, Send, Shield, Siren, Upload, Users, X, Zap, UserPlus,
+  Crosshair, Home, Lock, LogIn, Mail, Map as MapIcon, MapPin, Navigation,
+  PhoneCall, Radio, Route, Send, Shield, Siren, Upload, Users, X, Zap, UserPlus, LogOut,
+  RefreshCw,
 } from "lucide-react";
 import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { cn } from "@/utils/cn";
 import { useAuth } from "@/contexts/AuthContext";
+import { type AuthIntent, useRouteGuard } from "@/hooks/useRouteGuard";
+import { type IncidentChangedPayload, type RealtimeConnectionStatus, useIncidentRealtime } from "@/hooks/useIncidentRealtime";
+import {
+  homePageForRole,
+  PAGE_PATHS,
+  pageFromPath,
+  type CitizenTab,
+  type Page,
+} from "@/utils/routes";
+import type { AuthUser } from "@/contexts/AuthContext";
+import { DisasterMap } from "@/components/DisasterMap";
+import { mapIncidentFromApi } from "@/utils/incidents";
 import {
   incidentApi, rescueTeamApi, shelterApi, statsApi, userApi,
   INCIDENT_TYPE_MAP,
 } from "@/services/api";
 
 // ─── Types ───────────────────────────────────────────────────────────────
-type Page = "landing" | "citizen" | "admin" | "rescue" | "publicMap";
-type CitizenTab = "home" | "report" | "map" | "reports" | "shelters";
-type AdminTab = "dashboard" | "incidents" | "assign" | "analytics" | "shelters" | "users";
+type AdminTab = "dashboard" | "incidents" | "assign" | "analytics" | "shelters" | "teams" | "users";
 type Severity = "Critical" | "High" | "Medium" | "Low";
 type IncidentStatus = "Pending" | "Assigned" | "In Progress" | "On the way" | "Arrived" | "Rescued" | "Completed" | "Resolved";
 type TeamStatus = "Available" | "Assigned" | "Busy";
@@ -24,13 +35,13 @@ type NoticeType = "alert" | "assignment" | "success";
 type TimelineItem = { label: string; time: string };
 type Incident = {
   id: string; apiId?: number; type: string; severity: Severity; description: string;
-  location: string; x: number; y: number;
+  location: string; latitude: number; longitude: number; x: number; y: number;
   citizen: { name: string; phone: string; email: string };
   time: string; status: IncidentStatus; media: string[]; timeline: TimelineItem[];
   assignedTeamId?: string;
 };
 type RescueTeam = { id: string; name: string; station: string; distance: string; eta: string; members: number; status: TeamStatus };
-type Shelter = { id: string; apiId?: number; name: string; location: string; capacity: number; beds: number; contact: string; distance: string };
+type Shelter = { id: string; apiId?: number; name: string; location: string; capacity: number; beds: number; contact: string; distance: string; latitude?: number; longitude?: number };
 type Notice = { id: number; type: NoticeType; message: string };
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -56,16 +67,52 @@ const rescueStatuses: IncidentStatus[] = ["On the way", "Arrived", "Rescued", "C
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 const toBackendStatus = (s: string) => s.toLowerCase().replace(/ /g, "_");
-const fromBackendStatus = (s: string): IncidentStatus =>
-  s.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") as IncidentStatus;
 const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+function mapIncidentToFull(inc: { id: string; type: string; severity: string; description: string; location: string; latitude: number; longitude: number; time: string; status: string }): Incident {
+  return {
+    id: inc.id,
+    type: inc.type,
+    severity: inc.severity as Severity,
+    description: inc.description,
+    location: inc.location,
+    latitude: inc.latitude,
+    longitude: inc.longitude,
+    x: 0,
+    y: 0,
+    citizen: { name: "", phone: "", email: "" },
+    time: inc.time,
+    status: inc.status as IncidentStatus,
+    media: [],
+    timeline: [],
+  };
+}
+function friendlyError(raw: string): string {
+  if (!raw) return "Something went wrong. Please try again.";
+  const lower = raw.toLowerCase();
+  if (lower.includes("invalid credentials") || lower.includes("unauthenticated")) return "Email or password is incorrect. Please try again.";
+  if (lower.includes("validation") || lower.includes("the given data was invalid")) return "Please check your details and try again.";
+  if (lower.includes("network error") || lower.includes("failed to fetch")) return "Connection lost. Please check your internet and try again.";
+  if (lower.includes("500") || lower.includes("server error") || lower.includes("internal server")) return "Server is temporarily unavailable. Please try again in a moment.";
+  if (lower.includes("422") || lower.includes("unprocessable")) return "Please check the form and correct the highlighted fields.";
+  if (lower.includes("404") || lower.includes("not found")) return "The requested resource was not found.";
+  if (lower.includes("403") || lower.includes("forbidden")) return "You don't have permission to do this action.";
+  if (lower.includes("401")) return "Session expired. Please login again.";
+  if (lower.includes("too many")) return "Too many attempts. Please wait a moment and try again.";
+  if (lower.includes("email has already been taken")) return "This email is already registered. Please login instead.";
+  return raw;
+}
+function extractApiError(err: unknown): string {
+  const axiosErr = err as { response?: { data?: { message?: string; errors?: Record<string, string[]> } } };
+  const msg = axiosErr?.response?.data?.message ?? (axiosErr instanceof Error ? axiosErr.message : "");
+  const fieldErrors = axiosErr?.response?.data?.errors;
+  const details = fieldErrors ? Object.values(fieldErrors).flat().join(". ") : "";
+  return details ? `${msg}: ${details}` : msg;
+}
 function currentTimeLabel() { return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
-function pageFromPath(path: string): Page {
-  if (path.startsWith("/citizen")) return "citizen";
-  if (path.startsWith("/admin")) return "admin";
-  if (path.startsWith("/rescue")) return "rescue";
-  if (path.startsWith("/map")) return "publicMap";
-  return "landing";
+function primaryRole(roles: string[]): "admin" | "rescue" | "citizen" {
+  if (roles.includes("admin")) return "admin";
+  if (roles.includes("rescue")) return "rescue";
+  return "citizen";
 }
 
 // ─── Pure UI Components ──────────────────────────────────────────────────
@@ -83,49 +130,112 @@ function IconButton({ children, onClick, variant = "blue", type = "button", clas
 function CommandBackdrop() {
   return <div className="pointer-events-none fixed inset-0 -z-10 overflow-hidden bg-[#0B1220]"><div className="command-grid absolute inset-0 opacity-70" /><div className="absolute left-[-12%] top-[-20%] h-[520px] w-[520px] rounded-full bg-[#3B82F6]/16 blur-[120px]" /><div className="absolute bottom-[-18%] right-[-12%] h-[520px] w-[520px] rounded-full bg-[#FF3B30]/10 blur-[130px]" /><div className="radar-sweep absolute left-1/2 top-1/2 h-[70vmax] w-[70vmax] -translate-x-1/2 -translate-y-1/2 opacity-20" /></div>;
 }
-function Notifications({ notices }: { notices: Notice[] }) {
+function Notifications({ notices, onDismiss }: { notices: Notice[]; onDismiss: (id: number) => void }) {
   const s: Record<NoticeType, string> = { alert: "border-[#FF3B30]/40 bg-[#2A1118]/90 text-[#FFD2CF]", assignment: "border-[#3B82F6]/40 bg-[#0E1C35]/90 text-[#D8E7FF]", success: "border-[#34C759]/40 bg-[#10251B]/90 text-[#D9FFE2]" };
-  return <div className="fixed right-4 top-4 z-50 flex w-[min(360px,calc(100vw-2rem))] flex-col gap-3"><AnimatePresence>{notices.map((n) => <motion.div key={n.id} initial={{ opacity: 0, x: 60, scale: 0.96 }} animate={{ opacity: 1, x: 0, scale: 1 }} exit={{ opacity: 0, x: 60, scale: 0.96 }} className={cn("rounded-2xl border p-4 shadow-2xl backdrop-blur-xl", s[n.type])}><div className="flex items-start gap-3">{n.type === "alert" ? <Siren className="mt-0.5 h-5 w-5 text-[#FF3B30]" /> : null}{n.type === "assignment" ? <Bell className="mt-0.5 h-5 w-5 text-[#3B82F6]" /> : null}{n.type === "success" ? <CheckCircle2 className="mt-0.5 h-5 w-5 text-[#34C759]" /> : null}<p className="text-sm font-semibold leading-5">{n.message}</p></div></motion.div>)}</AnimatePresence></div>;
+  return <div className="fixed right-4 top-4 z-50 flex w-[min(380px,calc(100vw-2rem))] flex-col gap-3"><AnimatePresence>{notices.map((n) => <motion.div key={n.id} initial={{ opacity: 0, x: 60, scale: 0.96 }} animate={{ opacity: 1, x: 0, scale: 1 }} exit={{ opacity: 0, x: 60, scale: 0.96 }} className={cn("rounded-2xl border p-4 shadow-2xl backdrop-blur-xl", s[n.type])}><div className="flex items-start gap-3">{n.type === "alert" ? <Siren className="mt-0.5 h-5 w-5 shrink-0 text-[#FF3B30]" /> : null}{n.type === "assignment" ? <Bell className="mt-0.5 h-5 w-5 shrink-0 text-[#3B82F6]" /> : null}{n.type === "success" ? <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-[#34C759]" /> : null}<p className="flex-1 text-sm font-semibold leading-5">{n.message}</p><button type="button" onClick={() => onDismiss(n.id)} className="shrink-0 rounded-full p-1 text-current opacity-50 transition hover:opacity-100"><X className="h-3.5 w-3.5" /></button></div></motion.div>)}</AnimatePresence></div>;
 }
 function MetricTile({ icon, label, value, tone = "blue" }: { icon: ReactNode; label: string; value: string | number; tone?: "blue" | "red" | "green" | "yellow" }) {
   const t = { blue: "from-[#3B82F6]/24 to-[#3B82F6]/5 text-[#93C5FD]", red: "from-[#FF3B30]/24 to-[#FF3B30]/5 text-[#FF8A83]", green: "from-[#34C759]/24 to-[#34C759]/5 text-[#86EFAC]", yellow: "from-[#FFD60A]/22 to-[#FFD60A]/5 text-[#FFE16A]" };
-  return <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} className={cn("rounded-3xl border border-white/10 bg-gradient-to-br p-5 backdrop-blur-xl", t[tone])}><div className="flex items-center justify-between gap-4"><div className="text-[#AAB4C5]"><p className="text-xs font-bold uppercase tracking-[0.18em]">{label}</p><motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mt-2 text-4xl font-black text-white">{value}</motion.p></div><div className="rounded-2xl border border-white/10 bg-white/8 p-3">{icon}</div></div></motion.div>;
+  return <motion.div whileHover={{ y: -4, scale: 1.015 }} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} className={cn("rounded-3xl border border-white/10 bg-gradient-to-br p-5 backdrop-blur-xl transition-all duration-300 hover:border-white/20 hover:shadow-2xl", t[tone])}><div className="flex items-center justify-between gap-4"><div className="text-[#AAB4C5]"><p className="text-xs font-bold uppercase tracking-[0.18em]">{label}</p><motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mt-2 text-4xl font-black text-white">{value}</motion.p></div><div className="rounded-2xl border border-white/10 bg-white/8 p-3">{icon}</div></div></motion.div>;
 }
 function SidebarButton({ label, icon, active, onClick }: { label: string; icon: ReactNode; active: boolean; onClick: () => void }) {
   return <button type="button" onClick={onClick} className={cn("flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left text-sm font-semibold transition-all", active ? "bg-[#3B82F6]/18 text-white shadow-[0_0_28px_rgba(59,130,246,0.18)]" : "text-[#AAB4C5] hover:bg-white/8 hover:text-white")}>{icon}{label}</button>;
-}
-
-// ─── Tactical Map ────────────────────────────────────────────────────────
-function TacticalMap({ incidents, selectedIncident, onSelect, className = "", showRoute = false, title = "Live Disaster Map" }: { incidents: Incident[]; selectedIncident?: Incident | null; onSelect: (i: Incident) => void; className?: string; showRoute?: boolean; title?: string }) {
-  const rt = selectedIncident ?? incidents[0];
-  return (
-    <div className={cn("relative min-h-[420px] overflow-hidden rounded-[2rem] border border-white/10 bg-[#07101E] shadow-[0_0_60px_rgba(59,130,246,0.14)]", className)}>
-      <div className="map-grid absolute inset-0" />
-      <svg className="absolute inset-0 h-full w-full opacity-70" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-        <defs><linearGradient id="islandGlow" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stopColor="#1D4ED8" stopOpacity="0.18" /><stop offset="100%" stopColor="#22D3EE" stopOpacity="0.05" /></linearGradient></defs>
-        <path d="M50 10 C61 16 67 30 65 43 C74 55 67 72 56 88 C48 98 38 86 37 73 C29 62 34 48 32 37 C31 24 39 15 50 10 Z" fill="url(#islandGlow)" stroke="#3B82F6" strokeOpacity="0.34" strokeWidth="0.45" />
-        <path d="M18 24 C31 28 44 28 62 22 C74 18 84 21 93 27" stroke="#3B82F6" strokeOpacity="0.18" strokeWidth="0.3" fill="none" strokeDasharray="2 3" />
-        <path d="M10 68 C22 62 34 64 49 70 C63 76 77 75 92 67" stroke="#3B82F6" strokeOpacity="0.16" strokeWidth="0.3" fill="none" strokeDasharray="2 3" />
-        {showRoute && rt ? <motion.path d={`M22 82 C36 74 36 59 ${rt.x} ${rt.y}`} stroke="#3B82F6" strokeWidth="0.75" fill="none" strokeLinecap="round" strokeDasharray="2 2" initial={{ pathLength: 0, opacity: 0.2 }} animate={{ pathLength: 1, opacity: 0.95 }} transition={{ duration: 1.2, ease: "easeOut" }} /> : null}
-      </svg>
-      <div className="absolute left-5 top-5 z-10 flex items-center gap-3 rounded-full border border-white/10 bg-[#0B1220]/70 px-4 py-2 backdrop-blur-xl"><Radio className="h-4 w-4 text-[#34C759]" /><span className="text-xs font-bold uppercase tracking-[0.24em] text-white/80">{title}</span></div>
-      <div className="absolute bottom-5 left-5 z-10 rounded-2xl border border-white/10 bg-[#0B1220]/70 p-4 text-xs text-[#AAB4C5] backdrop-blur-xl"><div className="mb-3 font-bold uppercase tracking-[0.18em] text-white/70">Severity</div><div className="grid gap-2">{(["Critical", "High", "Medium"] as Severity[]).map((l) => <div key={l} className="flex items-center gap-2"><span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: severityMeta[l].color, boxShadow: `0 0 16px ${severityMeta[l].color}` }} /><span>{l}</span></div>)}</div></div>
-      {showRoute ? <div className="absolute bottom-5 right-5 z-10 rounded-2xl border border-[#3B82F6]/25 bg-[#0E1C35]/80 p-4 text-sm text-white backdrop-blur-xl"><div className="flex items-center gap-2 font-bold"><Route className="h-4 w-4 text-[#3B82F6]" />Route active</div><p className="mt-1 text-xs text-[#AAB4C5]">Base station to incident vector is live.</p></div> : null}
-      {incidents.map((inc) => { const m = severityMeta[inc.severity]; const sel = selectedIncident?.id === inc.id; return <motion.button key={inc.id} type="button" aria-label={`Open incident ${inc.id}`} onClick={() => onSelect(inc)} className="absolute z-20 -translate-x-1/2 -translate-y-1/2" style={{ left: `${inc.x}%`, top: `${inc.y}%` }} initial={{ scale: 0, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} whileHover={{ scale: 1.12 }}><span className="relative flex h-7 w-7 items-center justify-center"><motion.span className="absolute h-7 w-7 rounded-full" style={{ backgroundColor: m.color }} animate={{ scale: inc.severity === "Critical" ? [1, 2.4, 1] : [1, 1.8, 1], opacity: [0.42, 0, 0.42] }} transition={{ duration: inc.severity === "Critical" ? 1.1 : 1.8, repeat: Infinity }} /><span className={cn("relative h-3.5 w-3.5 rounded-full border-2 border-white", sel ? "scale-125" : "")} style={{ backgroundColor: m.color, boxShadow: `0 0 24px ${m.color}` }} /></span></motion.button>; })}
-      <AnimatePresence>{selectedIncident ? <motion.div key={selectedIncident.id} initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 24 }} className="absolute right-5 top-20 z-30 w-[min(360px,calc(100%-2.5rem))] rounded-3xl border border-white/10 bg-[#111C2E]/88 p-5 shadow-2xl backdrop-blur-2xl"><div className="flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">{selectedIncident.id}</p><h3 className="mt-1 text-xl font-bold text-white">{selectedIncident.type}</h3></div><SeverityBadge severity={selectedIncident.severity} /></div><div className="mt-4 grid gap-3 text-sm text-[#AAB4C5]"><div className="flex items-center gap-2"><Clock3 className="h-4 w-4 text-white/50" />{selectedIncident.time}</div><div className="flex items-center gap-2"><MapPin className="h-4 w-4 text-white/50" />{selectedIncident.location}</div><div className="flex items-center gap-2"><Activity className="h-4 w-4 text-white/50" /><StatusBadge status={selectedIncident.status} /></div></div><p className="mt-4 text-sm leading-6 text-white/78">{selectedIncident.description}</p></motion.div> : null}</AnimatePresence>
-    </div>
-  );
 }
 
 function BarAnalytics({ data }: { data: { label: string; value: number; color: string }[] }) {
   const mx = Math.max(...data.map((d) => d.value), 1);
   return <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><div className="mb-6 flex items-center justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">Analytics</p><h3 className="mt-2 text-xl font-black text-white">Disaster type frequency</h3></div><BarChart3 className="h-6 w-6 text-[#3B82F6]" /></div><div className="flex h-56 items-end gap-4">{data.map((d) => <div key={d.label} className="flex flex-1 flex-col items-center gap-3"><div className="flex h-44 w-full items-end rounded-t-2xl bg-white/5 px-2"><motion.div initial={{ height: 0 }} animate={{ height: `${Math.max((d.value / mx) * 100, 12)}%` }} transition={{ duration: 0.8, ease: "easeOut" }} className="w-full rounded-t-xl" style={{ background: `linear-gradient(180deg, ${d.color}, rgba(255,255,255,0.06))`, boxShadow: `0 0 22px ${d.color}55` }} /></div><div className="text-center"><p className="text-lg font-black text-white">{d.value}</p><p className="text-xs text-[#AAB4C5]">{d.label}</p></div></div>)}</div></div>;
 }
-function HeatMapPanel({ incidents }: { incidents: Incident[] }) {
-  return <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><div className="mb-5 flex items-center justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">Heatmap</p><h3 className="mt-2 text-xl font-black text-white">Most affected areas</h3></div><Crosshair className="h-6 w-6 text-[#FF3B30]" /></div><div className="relative min-h-64 overflow-hidden rounded-3xl border border-white/10 bg-[#07101E]"><div className="map-grid absolute inset-0 opacity-80" />{incidents.map((inc, i) => <motion.span key={inc.id} initial={{ opacity: 0, scale: 0 }} animate={{ opacity: 0.85, scale: 1 }} transition={{ delay: i * 0.08 }} className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full blur-sm" style={{ left: `${inc.x}%`, top: `${inc.y}%`, width: inc.severity === "Critical" ? 92 : 66, height: inc.severity === "Critical" ? 92 : 66, backgroundColor: severityMeta[inc.severity].color, opacity: inc.severity === "Critical" ? 0.28 : 0.18 }} />)}</div></div>;
+function HeatMapPanel({ incidents, shelters }: { incidents: Incident[]; shelters: Shelter[] }) {
+  return (
+    <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl">
+      <div className="mb-5 flex items-center justify-between gap-4">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">Heatmap</p>
+          <h3 className="mt-2 text-xl font-black text-white">Most affected areas</h3>
+        </div>
+        <Crosshair className="h-6 w-6 text-[#FF3B30]" />
+      </div>
+      <DisasterMap
+        incidents={incidents}
+        shelters={shelters}
+        selectedIncident={null}
+        onSelect={() => undefined}
+        className="min-h-64"
+        title="Affected areas"
+        compact
+        showDetailPanel={false}
+      />
+    </div>
+  );
 }
-function OperationalShell({ title, subtitle, sidebar, children, onExit, signalLabel }: { title: string; subtitle: string; sidebar: ReactNode; children: ReactNode; onExit: () => void; signalLabel: string }) {
-  return <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen p-4 text-white sm:p-6"><div className="mx-auto flex max-w-[1540px] gap-5"><aside className="hidden w-72 shrink-0 rounded-[2rem] border border-white/10 bg-[#111C2E]/78 p-4 backdrop-blur-2xl lg:block"><button type="button" onClick={onExit} className="mb-8 flex items-center gap-3 px-2 text-left"><span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#3B82F6]/18 shadow-[0_0_26px_rgba(59,130,246,0.28)]"><Shield className="h-6 w-6 text-[#3B82F6]" /></span><span><span className="block text-lg font-black tracking-[0.18em]">SAFE</span><span className="block text-xs font-bold uppercase tracking-[0.28em] text-[#AAB4C5]">Lanka Grid</span></span></button><nav className="grid gap-2">{sidebar}</nav></aside><main className="min-w-0 flex-1"><header className="mb-5 flex flex-col gap-4 rounded-[2rem] border border-white/10 bg-[#111C2E]/70 p-5 backdrop-blur-2xl md:flex-row md:items-center md:justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.28em] text-[#3B82F6]">{signalLabel}</p><h1 className="mt-2 text-3xl font-black tracking-tight md:text-4xl">{title}</h1><p className="mt-2 text-sm text-[#AAB4C5]">{subtitle}</p></div><div className="flex flex-wrap items-center gap-3"><div className="rounded-full border border-[#34C759]/30 bg-[#34C759]/10 px-4 py-2 text-xs font-bold uppercase tracking-[0.18em] text-[#86EFAC]"><span className="mr-2 inline-block h-2 w-2 rounded-full bg-[#34C759] shadow-[0_0_14px_#34C759]" />WebSocket live</div><IconButton variant="gray" onClick={onExit} className="px-4 py-2"><Home className="h-4 w-4" /> Home</IconButton></div></header>{children}</main></div></motion.div>;
+function LiveStatusBadge({ status }: { status: RealtimeConnectionStatus }) {
+  // Don't show badge when disconnected (Reverb not running) - avoids confusing "Offline" label
+  if (status === "disconnected") return null;
+
+  const meta = {
+    connected: { dot: "bg-[#34C759] shadow-[0_0_14px_#34C759]", label: "Live", text: "text-[#86EFAC]", border: "border-[#34C759]/30 bg-[#34C759]/10" },
+    connecting: { dot: "bg-[#FFD60A] shadow-[0_0_14px_#FFD60A] animate-pulse", label: "Connecting", text: "text-[#FFE16A]", border: "border-[#FFD60A]/30 bg-[#FFD60A]/10" },
+    disconnected: { dot: "", label: "", text: "", border: "" },
+  }[status];
+
+  return (
+    <div className={cn("rounded-full border px-4 py-2 text-xs font-bold uppercase tracking-[0.18em]", meta.border, meta.text)}>
+      <span className={cn("mr-2 inline-block h-2 w-2 rounded-full", meta.dot)} />
+      {meta.label}
+    </div>
+  );
+}
+
+function OperationalShell({
+  title, subtitle, sidebar, children, onExit, signalLabel, userLabel, onLogout, realtimeStatus, onRefresh, isRefreshing,
+}: {
+  title: string;
+  subtitle: string;
+  sidebar: ReactNode;
+  children: ReactNode;
+  onExit: () => void;
+  signalLabel: string;
+  userLabel?: string;
+  onLogout?: () => void;
+  realtimeStatus: RealtimeConnectionStatus;
+  onRefresh?: () => void;
+  isRefreshing?: boolean;
+}) {
+  return (
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen p-4 text-white sm:p-6">
+      <div className="mx-auto flex max-w-[1540px] gap-5">
+        <aside className="hidden w-72 shrink-0 rounded-[2rem] border border-white/10 bg-[#111C2E]/78 p-4 backdrop-blur-2xl lg:block">
+          <button type="button" onClick={onExit} className="mb-8 flex items-center gap-3 px-2 text-left">
+            <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#3B82F6]/18 shadow-[0_0_26px_rgba(59,130,246,0.28)]"><Shield className="h-6 w-6 text-[#3B82F6]" /></span>
+            <span><span className="block text-lg font-black tracking-[0.18em]">SAFE</span><span className="block text-xs font-bold uppercase tracking-[0.28em] text-[#AAB4C5]">Lanka Grid</span></span>
+          </button>
+          <nav className="grid gap-2">{sidebar}</nav>
+        </aside>
+        <main className="min-w-0 flex-1">
+          <header className="mb-5 flex flex-col gap-4 rounded-[2rem] border border-white/10 bg-[#111C2E]/70 p-5 backdrop-blur-2xl md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-[0.28em] text-[#3B82F6]">{signalLabel}</p>
+              <h1 className="mt-2 text-3xl font-black tracking-tight md:text-4xl">{title}</h1>
+              <p className="mt-2 text-sm text-[#AAB4C5]">{subtitle}</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              {userLabel ? <span className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold text-[#AAB4C5]">{userLabel}</span> : null}
+              <LiveStatusBadge status={realtimeStatus} />
+              {onRefresh ? (
+                <IconButton variant="gray" onClick={onRefresh} className="px-4 py-2">
+                  <RefreshCw className={cn("h-4 w-4", isRefreshing && "animate-spin")} /> புதுப்பி (Refresh)
+                </IconButton>
+              ) : null}
+              <IconButton variant="gray" onClick={onExit} className="px-4 py-2"><Home className="h-4 w-4" /> Home</IconButton>
+              {onLogout ? <IconButton variant="red" onClick={onLogout} className="px-4 py-2"><LogOut className="h-4 w-4" /> Logout</IconButton> : null}
+            </div>
+          </header>
+          {children}
+        </main>
+      </div>
+    </motion.div>
+  );
 }
 
 // ─── App ─────────────────────────────────────────────────────────────────
@@ -147,6 +257,9 @@ export default function App() {
   const [notices, setNotices] = useState<Notice[]>([]);
   const [landingShake, setLandingShake] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [loginError, setLoginError] = useState("");
+  const [registerError, setRegisterError] = useState("");
+  const [reportError, setReportError] = useState("");
   const [latestTicket, setLatestTicket] = useState("");
   const [statsData, setStatsData] = useState({ active: 0, total: 0, availableTeams: 0 });
   const [loginEmail, setLoginEmail] = useState("");
@@ -154,15 +267,66 @@ export default function App() {
   const [regForm, setRegForm] = useState({ name: "", email: "", phone: "", password: "", password_confirmation: "" });
   const [reportForm, setReportForm] = useState({ gpsLocation: "Tap to detect GPS location", manualLocation: "", type: "Flood", severity: "Critical" as Severity, description: "", media: "" });
   const [shelterForm, setShelterForm] = useState({ name: "", location: "", capacity: "", beds: "", contact: "" });
-  const [createUserForm, setCreateUserForm] = useState({ name: "", email: "", phone: "", password: "", role: "rescue" });
+  const [editingShelterId, setEditingShelterId] = useState<number | null>(null);
+  const [createUserForm, setCreateUserForm] = useState({
+    name: "", email: "", phone: "", password: "", role: "rescue", rescue_team_id: "",
+  });
+  const [usersList, setUsersList] = useState<{ id: number; name: string; email: string; phone: string | null; is_active: boolean; roles: string[]; created_at: string }[]>([]);
+  const [userSearch, setUserSearch] = useState("");
+  const [teamForm, setTeamForm] = useState({ name: "", station_name: "", contact_phone: "", status: "available", default_eta_minutes: "" });
+  const [editingTeamId, setEditingTeamId] = useState<number | null>(null);
   const [mediaFile, setMediaFile] = useState<File | null>(null);
+  const [authIntent, setAuthIntent] = useState<AuthIntent | null>(null);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   // ─── Navigate on page change ───────────────────────────────────────────
   const go = useCallback((p: Page) => {
-    const paths: Record<Page, string> = { landing: "/", citizen: "/citizen", admin: "/admin", rescue: "/rescue", publicMap: "/map" };
     setPage(p);
-    navigate(paths[p]);
+    navigate(PAGE_PATHS[p]);
   }, [navigate]);
+
+  const onAuthRequired = useCallback((intent: AuthIntent) => {
+    setAuthIntent(intent);
+    setLoginOpen(true);
+    const id = Date.now();
+    setNotices((current) => [
+      { id, type: "alert" as NoticeType, message: "Please login to access this page." },
+      ...current,
+    ].slice(0, 4));
+    window.setTimeout(() => setNotices((current) => current.filter((n) => n.id !== id)), 4200);
+  }, []);
+
+  const onRoleDenied = useCallback((message: string) => {
+    const id = Date.now();
+    setNotices((current) => [
+      { id, type: "alert" as NoticeType, message },
+      ...current,
+    ].slice(0, 4));
+    window.setTimeout(() => setNotices((current) => current.filter((n) => n.id !== id)), 4200);
+  }, []);
+
+  useRouteGuard({
+    isAuthenticated: auth.isAuthenticated,
+    role: auth.role,
+    isInitializing: auth.isInitializing,
+    location,
+    navigate,
+    setPage,
+    onAuthRequired,
+    onRoleDenied,
+  });
 
   // ─── Fetch stats (public) ──────────────────────────────────────────────
   const fetchStats = useCallback(async () => {
@@ -173,31 +337,31 @@ export default function App() {
     } catch { /* ignore */ }
   }, []);
 
+
+
+  const applyIncidentList = useCallback((mapped: Incident[]) => {
+    setIncidents(mapped);
+    if (mapped.length > 0) {
+      setSelectedIncident((current) => current ?? mapped[0]);
+    }
+  }, []);
+
   // ─── Fetch incidents ───────────────────────────────────────────────────
+  const fetchPublicIncidents = useCallback(async () => {
+    try {
+      const res = await incidentApi.listPublic({ per_page: 100 });
+      const items = res.data.data.items ?? [];
+      applyIncidentList(items.map((it: any) => mapIncidentFromApi(it, { publicView: true }) as Incident));
+    } catch { /* ignore */ }
+  }, [applyIncidentList]);
+
   const fetchIncidents = useCallback(async () => {
     try {
       const res = await incidentApi.list({ per_page: 100 });
       const items = res.data.data.items ?? [];
-      const mapped: Incident[] = items.map((it: Record<string, unknown>) => ({
-        id: (it as { public_id: string }).public_id,
-        apiId: (it as { id: number }).id,
-        type: ((it as { type: { name: string } }).type?.name) ?? "Unknown",
-        severity: capitalize((it as { severity: string }).severity) as Severity,
-        description: (it as { description: string }).description ?? "",
-        location: (it as { location: { text: string } }).location?.text ?? "",
-        x: Math.floor(39 + Math.random() * 18),
-        y: Math.floor(42 + Math.random() * 31),
-        citizen: { name: (it as { reporter?: { name: string } }).reporter?.name ?? "Unknown", phone: "", email: "" },
-        time: new Date((it as { timestamps: { created_at: string } }).timestamps?.created_at).toLocaleString(),
-        status: fromBackendStatus((it as { status: string }).status),
-        media: [],
-        timeline: [{ label: "Incident created", time: new Date((it as { timestamps: { created_at: string } }).timestamps?.created_at).toLocaleString() }],
-        assignedTeamId: (it as { assigned_team?: { id: number } }).assigned_team?.id?.toString(),
-      }));
-      setIncidents(mapped);
-      if (mapped.length > 0 && !selectedIncident) setSelectedIncident(mapped[0]);
+      applyIncidentList(items.map((it: any) => mapIncidentFromApi(it) as Incident));
     } catch { /* ignore */ }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [applyIncidentList]);
 
   // ─── Fetch teams ───────────────────────────────────────────────────────
   const fetchTeams = useCallback(async () => {
@@ -230,19 +394,43 @@ export default function App() {
         beds: s.available_beds as number,
         contact: (s.contact_phone as string) ?? "",
         distance: "N/A",
+        latitude: s.latitude != null ? Number(s.latitude) : undefined,
+        longitude: s.longitude != null ? Number(s.longitude) : undefined,
       }));
       setShelters(mapped);
     } catch { /* ignore */ }
   }, []);
 
+  // ─── Manual refresh (defined after all fetch fns to avoid hoisting error) ──
+  const handleManualRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      await Promise.all([
+        fetchStats(),
+        auth.isAuthenticated ? fetchIncidents() : fetchPublicIncidents(),
+        auth.isAuthenticated ? fetchTeams() : Promise.resolve(),
+        auth.isAuthenticated ? fetchShelters() : Promise.resolve(),
+      ]);
+      pushNotice("success", "தகவல்கள் அனைத்தும் புதுப்பிக்கப்பட்டன. (Data refreshed.)");
+    } catch {
+      pushNotice("alert", "புதுப்பித்தல் தோல்வியடைந்தது. (Failed to refresh data.)");
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [auth.isAuthenticated, fetchStats, fetchIncidents, fetchPublicIncidents, fetchTeams, fetchShelters]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ─── Load data on auth ─────────────────────────────────────────────────
   useEffect(() => { fetchStats(); }, [fetchStats]);
   useEffect(() => {
-    if (auth.isAuthenticated) { fetchIncidents(); fetchTeams(); fetchShelters(); }
-  }, [auth.isAuthenticated]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ─── Sync page from URL ────────────────────────────────────────────────
-  useEffect(() => { setPage(pageFromPath(location.pathname)); }, [location.pathname]);
+    if (auth.isInitializing) return;
+    if (auth.isAuthenticated) {
+      fetchIncidents();
+      fetchTeams();
+      fetchShelters();
+    } else {
+      fetchPublicIncidents();
+    }
+  }, [auth.isAuthenticated, auth.isInitializing, fetchIncidents, fetchPublicIncidents, fetchTeams, fetchShelters]);
 
   const stats = useMemo(() => {
     const active = incidents.filter((i) => !["Resolved", "Completed"].includes(i.status)).length;
@@ -252,15 +440,139 @@ export default function App() {
     return { total: incidents.length, active: active || statsData.active, resolved, availableTeams: availableTeams || statsData.availableTeams, typeCounts };
   }, [incidents, teams, statsData]);
 
-  const assignedMissions = useMemo(() => incidents.filter((i) => i.assignedTeamId && !["Resolved", "Completed"].includes(i.status)), [incidents]);
+  const assignedMissions = useMemo(() => {
+    const active = incidents.filter((i) => i.assignedTeamId && !["Resolved", "Completed"].includes(i.status));
+    if (auth.role === "rescue" && auth.user?.rescue_team?.id) {
+      const teamId = String(auth.user.rescue_team.id);
+      return active.filter((i) => i.assignedTeamId === teamId);
+    }
+    return active;
+  }, [incidents, auth.role, auth.user?.rescue_team?.id]);
+
+  const rescueMapIncidents = useMemo(() => {
+    if (auth.role !== "rescue") return incidents;
+    const teamId = auth.user?.rescue_team?.id?.toString();
+    if (!teamId) return [];
+    return incidents.filter((i) => i.assignedTeamId === teamId);
+  }, [incidents, auth.role, auth.user?.rescue_team?.id]);
 
   function pushNotice(type: NoticeType, message: string) {
     const id = Date.now() + Math.floor(Math.random() * 1000);
     setNotices((c) => [{ id, type, message }, ...c].slice(0, 4));
-    window.setTimeout(() => setNotices((c) => c.filter((n) => n.id !== id)), 4200);
+    window.setTimeout(() => setNotices((c) => c.filter((n) => n.id !== id)), 6000);
   }
-  function openReportFlow() { setLandingShake(true); window.setTimeout(() => { setLandingShake(false); setCitizenTab("report"); go("citizen"); }, 260); }
+
+  function dismissNotice(id: number) {
+    setNotices((c) => c.filter((n) => n.id !== id));
+  }
+
+  const handleRealtimeIncident = useCallback((payload: IncidentChangedPayload) => {
+    const apiItem = auth.isAuthenticated ? payload.incident : payload.public_incident;
+    const mapped = mapIncidentFromApi(apiItem, { publicView: !auth.isAuthenticated }) as Incident;
+    const isTerminal = ["resolved", "completed"].includes(apiItem.status);
+
+    setIncidents((current) => {
+      if (!auth.isAuthenticated && isTerminal) {
+        return current.filter((i) => i.id !== mapped.id);
+      }
+
+      const idx = current.findIndex((i) => i.id === mapped.id);
+      if (idx >= 0) {
+        const next = [...current];
+        next[idx] = { ...next[idx], ...mapped };
+        return next;
+      }
+
+      return [mapped, ...current];
+    });
+
+    setSelectedIncident((current) => (current?.id === mapped.id ? { ...current, ...mapped } : current));
+    fetchStats();
+
+    const noticeByAction: Record<IncidentChangedPayload["action"], { type: NoticeType; message: string }> = {
+      created: { type: "alert", message: `Live alert: new emergency ${mapped.id}` },
+      assigned: { type: "assignment", message: `Team assigned to ${mapped.id}` },
+      status_changed: { type: "assignment", message: `${mapped.id} status → ${mapped.status}` },
+      updated: { type: "assignment", message: `${mapped.id} updated live` },
+    };
+    const notice = noticeByAction[payload.action];
+    pushNotice(notice.type, notice.message);
+
+    if (payload.action === "created") {
+      setLandingShake(true);
+      window.setTimeout(() => setLandingShake(false), 900);
+    }
+  }, [auth.isAuthenticated, fetchStats]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const realtimeStatus = useIncidentRealtime({
+    enabled: !auth.isInitializing,
+    isAuthenticated: auth.isAuthenticated,
+    role: auth.role,
+    userId: auth.user?.id,
+    rescueTeamId: auth.user?.rescue_team?.id,
+    onIncidentChanged: handleRealtimeIncident,
+  });
+
+  useEffect(() => {
+    if (auth.isInitializing || realtimeStatus === "connected") return;
+
+    const interval = window.setInterval(() => {
+      if (auth.isAuthenticated) {
+        fetchIncidents();
+      } else {
+        fetchPublicIncidents();
+      }
+      fetchStats();
+    }, 30000);
+
+    return () => window.clearInterval(interval);
+  }, [auth.isAuthenticated, auth.isInitializing, realtimeStatus, fetchIncidents, fetchPublicIncidents, fetchStats]);
+  function requireCitizenForReport(): boolean {
+    if (!auth.isAuthenticated) {
+      setAuthIntent({ page: "citizen", citizenTab: "report" });
+      setLoginOpen(true);
+      pushNotice("alert", "Login or register as a citizen to report an emergency.");
+      return false;
+    }
+    if (auth.role !== "citizen") {
+      pushNotice("alert", "Emergency reports must be submitted from a citizen account.");
+      return false;
+    }
+    return true;
+  }
+
+  function openReportFlow() {
+    if (!requireCitizenForReport()) return;
+    setLandingShake(true);
+    window.setTimeout(() => {
+      setLandingShake(false);
+      setCitizenTab("report");
+      go("citizen");
+    }, 260);
+  }
+
   function updateIncident(u: Incident) { setIncidents((c) => c.map((i) => (i.id === u.id ? u : i))); setSelectedIncident((c) => (c?.id === u.id ? u : c)); }
+
+  function navigateAfterAuth(user: AuthUser) {
+    if (authIntent) {
+      const intent = authIntent;
+      setAuthIntent(null);
+      const userRole = primaryRole(user.roles);
+      const intentNeedsCitizen = intent.page === "citizen" || intent.citizenTab === "report";
+      if (intentNeedsCitizen && userRole !== "citizen") {
+        pushNotice("alert", "Use a citizen account to report emergencies.");
+        go(homePageForRole(userRole));
+        return;
+      }
+      if (intent.citizenTab) setCitizenTab(intent.citizenTab);
+      go(intent.page);
+      return;
+    }
+    const userRole = primaryRole(user.roles);
+    if (userRole === "admin") { setAdminTab("dashboard"); go("admin"); }
+    else if (userRole === "rescue") { go("rescue"); }
+    else { setCitizenTab("home"); go("citizen"); }
+  }
 
   // ─── GPS ───────────────────────────────────────────────────────────────
   function detectGPS() {
@@ -276,8 +588,9 @@ export default function App() {
   // ─── Submit Emergency ──────────────────────────────────────────────────
   async function submitEmergency(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    const ticket = `SL-${Math.floor(10000 + Math.random() * 89999)}`;
+    if (!requireCitizenForReport()) return;
     setSubmitting(true);
+    setReportError("");
     try {
       const gpsParts = reportForm.gpsLocation.replace("GPS: ", "").split(",");
       const lat = parseFloat(gpsParts[0]) || undefined;
@@ -290,16 +603,12 @@ export default function App() {
         latitude: lat, longitude: lng,
       });
       const created = res.data.data.incident;
-      const newInc: Incident = {
-        id: created.public_id, apiId: created.id,
-        type: created.type?.name ?? reportForm.type,
-        severity: capitalize(created.severity) as Severity,
-        description: created.description, location: created.location?.text ?? "",
-        x: Math.floor(39 + Math.random() * 18), y: Math.floor(42 + Math.random() * 31),
+      const newInc = {
+        ...mapIncidentFromApi(created),
         citizen: { name: auth.user?.name ?? "Citizen", phone: "", email: auth.user?.email ?? "" },
-        time: "Just now", status: fromBackendStatus(created.status),
-        media: [], timeline: [{ label: "Emergency submitted", time: "Now" }],
-      };
+        time: "Just now",
+        timeline: [{ label: "Emergency submitted", time: "Now" }],
+      } as Incident;
       setLatestTicket(created.public_id);
       setIncidents((c) => [newInc, ...c]);
       setSelectedIncident(newInc);
@@ -311,8 +620,8 @@ export default function App() {
       setMediaFile(null);
       pushNotice("assignment", "Rescue teams received the new emergency alert.");
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message ?? "Failed to submit";
-      pushNotice("alert", msg);
+      const msg = extractApiError(err);
+      setReportError(friendlyError(msg || "Failed to submit emergency. Please try again."));
     } finally { setSubmitting(false); }
   }
 
@@ -343,60 +652,227 @@ export default function App() {
     } catch { pushNotice("alert", "Failed to update status."); }
   }
 
-  // ─── Add Shelter ───────────────────────────────────────────────────────
-  async function addShelter(e: FormEvent<HTMLFormElement>) {
+  // ─── Add / Update Shelter ──────────────────────────────────────────────
+  async function saveShelter(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const payload = {
+      name: shelterForm.name || "New Shelter",
+      location_text: shelterForm.location || "Pending",
+      capacity: Number(shelterForm.capacity || 0),
+      available_beds: Number(shelterForm.beds || 0),
+      contact_phone: shelterForm.contact || undefined,
+    };
     try {
-      await shelterApi.create({ name: shelterForm.name || "New Shelter", location_text: shelterForm.location || "Pending", capacity: Number(shelterForm.capacity || 0), available_beds: Number(shelterForm.beds || 0), contact_phone: shelterForm.contact });
+      if (editingShelterId) {
+        await shelterApi.update(editingShelterId, payload);
+        pushNotice("success", "Shelter updated.");
+      } else {
+        await shelterApi.create(payload);
+        pushNotice("success", "Shelter added.");
+      }
       fetchShelters();
-      setShelterForm({ name: "", location: "", capacity: "", beds: "", contact: "" });
-      pushNotice("success", "Shelter added.");
-    } catch { pushNotice("alert", "Failed to add shelter."); }
+      resetShelterForm();
+    } catch {
+      pushNotice("alert", editingShelterId ? "Failed to update shelter." : "Failed to add shelter.");
+    }
   }
 
   // ─── Admin Create User ─────────────────────────────────────────────────
   async function createRescueUser(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     try {
-      await userApi.create(createUserForm);
-      setCreateUserForm({ name: "", email: "", phone: "", password: "", role: "rescue" });
+      const payload = {
+        name: createUserForm.name,
+        email: createUserForm.email,
+        phone: createUserForm.phone || undefined,
+        password: createUserForm.password,
+        role: createUserForm.role,
+        ...(createUserForm.role === "rescue"
+          ? { rescue_team_id: Number(createUserForm.rescue_team_id || teams[0]?.id) }
+          : {}),
+      };
+      await userApi.create(payload);
+      setCreateUserForm({ name: "", email: "", phone: "", password: "", role: "rescue", rescue_team_id: teams[0]?.id ?? "" });
       pushNotice("success", "User created.");
+      fetchUsers();
     } catch { pushNotice("alert", "Failed to create user."); }
+  }
+
+  // ─── Fetch Users ───────────────────────────────────────────────────────
+  const fetchUsers = useCallback(async (search?: string) => {
+    try {
+      const res = await userApi.list({ per_page: 50, search: search || undefined });
+      setUsersList(res.data.data.items ?? []);
+    } catch { /* ignore */ }
+  }, []);
+
+  // ─── Deactivate User ──────────────────────────────────────────────────
+  /*
+  async function deactivateUser(userId: number) {
+    try {
+      await userApi.destroy(userId);
+      pushNotice("success", "User deactivated.");
+      fetchUsers(userSearch);
+    } catch { pushNotice("alert", "Failed to deactivate user."); }
+  }
+  */
+
+  // ─── Toggle User Active ───────────────────────────────────────────────
+  async function toggleUserActive(userId: number, isActive: boolean) {
+    try {
+      await userApi.update(userId, { is_active: !isActive });
+      pushNotice("success", isActive ? "User deactivated." : "User activated.");
+      fetchUsers(userSearch);
+    } catch { pushNotice("alert", "Failed to update user."); }
+  }
+
+  // ─── Team CRUD ─────────────────────────────────────────────────────────
+  async function saveTeam(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const payload = {
+      name: teamForm.name,
+      station_name: teamForm.station_name,
+      contact_phone: teamForm.contact_phone || undefined,
+      status: teamForm.status,
+      default_eta_minutes: teamForm.default_eta_minutes ? Number(teamForm.default_eta_minutes) : undefined,
+    };
+    try {
+      if (editingTeamId) {
+        await rescueTeamApi.update(editingTeamId, payload);
+        pushNotice("success", "Team updated.");
+      } else {
+        await rescueTeamApi.create(payload);
+        pushNotice("success", "Team created.");
+      }
+      setTeamForm({ name: "", station_name: "", contact_phone: "", status: "available", default_eta_minutes: "" });
+      setEditingTeamId(null);
+      fetchTeams();
+    } catch { pushNotice("alert", editingTeamId ? "Failed to update team." : "Failed to create team."); }
+  }
+
+  function startEditTeam(t: RescueTeam) {
+    setEditingTeamId(Number(t.id));
+    setTeamForm({ name: t.name, station_name: t.station, contact_phone: "", status: t.status.toLowerCase(), default_eta_minutes: t.eta.replace(" min", "") });
+  }
+
+  async function deactivateTeam(teamId: number) {
+    try {
+      await rescueTeamApi.destroy(teamId);
+      pushNotice("success", "Team deactivated.");
+      fetchTeams();
+    } catch { pushNotice("alert", "Failed to deactivate team."); }
   }
 
   // ─── Login ─────────────────────────────────────────────────────────────
   async function submitLogin(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    setLoginError("");
     try {
       const user = await auth.login(loginEmail, loginPassword);
       setLoginOpen(false);
-      setLoginEmail(""); setLoginPassword("");
-      const r = user.roles;
-      if (r.includes("admin")) { setAdminTab("dashboard"); go("admin"); }
-      else if (r.includes("rescue")) { go("rescue"); }
-      else { setCitizenTab("home"); go("citizen"); }
+      setLoginEmail(""); setLoginPassword(""); setLoginError("");
+      navigateAfterAuth(user);
       pushNotice("success", `Welcome ${user.name}`);
-    } catch { pushNotice("alert", "Invalid credentials."); }
+    } catch (err: unknown) {
+      console.error("Login error:", err);
+      const msg = extractApiError(err);
+      setLoginError(friendlyError(msg || "Invalid credentials. Please try again."));
+    }
   }
 
   // ─── Register ──────────────────────────────────────────────────────────
   async function submitRegister(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    setRegisterError("");
     try {
       const user = await auth.register(regForm.name, regForm.email, regForm.phone, regForm.password, regForm.password_confirmation);
       setRegisterOpen(false);
-      setRegForm({ name: "", email: "", phone: "", password: "", password_confirmation: "" });
-      setCitizenTab("home"); go("citizen");
+      setRegForm({ name: "", email: "", phone: "", password: "", password_confirmation: "" }); setRegisterError("");
+      navigateAfterAuth(user);
       pushNotice("success", `Welcome ${user.name}! Account created.`);
-    } catch { pushNotice("alert", "Registration failed. Check your details."); }
+    } catch (err: unknown) {
+      console.error("Register error:", err);
+      const msg = extractApiError(err);
+      setRegisterError(friendlyError(msg || "Registration failed. Please try again."));
+    }
   }
 
   function closeSelectedCase() { if (selectedIncident) setIncidentStatus(selectedIncident, "Resolved"); }
 
+  const handleLogout = useCallback(async () => {
+    await auth.logout();
+    setAuthIntent(null);
+    setSelectedIncident(null);
+    go("landing");
+    fetchPublicIncidents();
+    pushNotice("success", "Logged out successfully.");
+  }, [auth, go, fetchPublicIncidents]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const shellAuthProps = {
+    realtimeStatus,
+    ...(auth.isAuthenticated ? { userLabel: auth.user?.name, onLogout: handleLogout } : {}),
+  };
+
+  function resetShelterForm() {
+    setShelterForm({ name: "", location: "", capacity: "", beds: "", contact: "" });
+    setEditingShelterId(null);
+  }
+
+  function startEditShelter(shelter: Shelter) {
+    if (!shelter.apiId) return;
+    setEditingShelterId(shelter.apiId);
+    setShelterForm({
+      name: shelter.name,
+      location: shelter.location,
+      capacity: String(shelter.capacity),
+      beds: String(shelter.beds),
+      contact: shelter.contact,
+    });
+  }
+
+  async function deleteShelter(shelter: Shelter) {
+    if (!shelter.apiId) return;
+    if (!window.confirm(`Remove shelter "${shelter.name}"?`)) return;
+    try {
+      await shelterApi.destroy(shelter.apiId);
+      if (editingShelterId === shelter.apiId) resetShelterForm();
+      fetchShelters();
+      pushNotice("success", "Shelter removed.");
+    } catch {
+      pushNotice("alert", "Failed to remove shelter.");
+    }
+  }
+
   // ─── Reusable sub-components ───────────────────────────────────────────
-  function ShelterRow({ shelter }: { shelter: Shelter }) {
+  function ShelterRow({
+    shelter, adminMode, onEdit, onDelete,
+  }: {
+    shelter: Shelter;
+    adminMode?: boolean;
+    onEdit?: () => void;
+    onDelete?: () => void;
+  }) {
     const avail = shelter.capacity ? Math.round((shelter.beds / shelter.capacity) * 100) : 0;
-    return <motion.div whileHover={{ y: -3, scale: 1.01 }} className="rounded-2xl border border-white/10 bg-white/5 p-4 transition hover:border-[#34C759]/35 hover:shadow-[0_0_24px_rgba(52,199,89,0.14)]"><div className="flex items-start justify-between gap-4"><div><p className="font-bold text-white">{shelter.name}</p><p className="mt-1 text-sm text-[#AAB4C5]">{shelter.location} - {shelter.distance}</p></div><span className="rounded-full border border-[#34C759]/30 bg-[#34C759]/10 px-3 py-1 text-xs font-bold text-[#86EFAC]">{shelter.beds} beds</span></div><div className="mt-4 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-[#34C759]" style={{ width: `${Math.min(avail, 100)}%` }} /></div><div className="mt-4 flex items-center justify-between gap-3 text-sm text-[#AAB4C5]"><span>{avail}% available</span><button type="button" className="flex items-center gap-2 font-bold text-[#3B82F6]"><Navigation className="h-4 w-4" /> Navigate</button></div></motion.div>;
+    return (
+      <motion.div whileHover={{ y: -3, scale: 1.01 }} className="rounded-2xl border border-white/10 bg-white/5 p-4 transition hover:border-[#34C759]/35 hover:shadow-[0_0_24px_rgba(52,199,89,0.14)]">
+        <div className="flex items-start justify-between gap-4">
+          <div><p className="font-bold text-white">{shelter.name}</p><p className="mt-1 text-sm text-[#AAB4C5]">{shelter.location} - {shelter.distance}</p></div>
+          <span className="rounded-full border border-[#34C759]/30 bg-[#34C759]/10 px-3 py-1 text-xs font-bold text-[#86EFAC]">{shelter.beds} beds</span>
+        </div>
+        <div className="mt-4 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-[#34C759]" style={{ width: `${Math.min(avail, 100)}%` }} /></div>
+        <div className="mt-4 flex items-center justify-between gap-3 text-sm text-[#AAB4C5]">
+          <span>{avail}% available</span>
+          {adminMode ? (
+            <div className="flex gap-2">
+              <button type="button" onClick={onEdit} className="rounded-xl border border-[#3B82F6]/35 bg-[#3B82F6]/10 px-3 py-1.5 text-xs font-bold text-[#93C5FD] transition hover:bg-[#3B82F6]/20">Edit</button>
+              <button type="button" onClick={onDelete} className="rounded-xl border border-[#FF3B30]/35 bg-[#FF3B30]/10 px-3 py-1.5 text-xs font-bold text-[#FF8A83] transition hover:bg-[#FF3B30]/20">Delete</button>
+            </div>
+          ) : (
+            <button type="button" className="flex items-center gap-2 font-bold text-[#3B82F6]"><Navigation className="h-4 w-4" /> Navigate</button>
+          )}
+        </div>
+      </motion.div>
+    );
   }
   function IncidentSummary({ incident, onClick }: { incident: Incident; onClick: () => void }) {
     return <motion.button whileHover={{ y: -3 }} type="button" onClick={onClick} className={cn("rounded-[2rem] border bg-[#111C2E]/76 p-5 text-left backdrop-blur-2xl transition hover:bg-[#16243A]/90", severityMeta[incident.severity].border, severityMeta[incident.severity].glow)}><div className="flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">{incident.id}</p><h3 className="mt-2 text-xl font-black text-white">{incident.type}</h3><p className="mt-2 text-sm text-[#AAB4C5]">{incident.location}</p></div><SeverityBadge severity={incident.severity} /></div><p className="mt-4 line-clamp-2 text-sm leading-6 text-[#AAB4C5]">{incident.description}</p><div className="mt-5 flex items-center justify-between gap-3"><StatusBadge status={incident.status} /><span className="text-xs text-[#6B7A90]">{incident.time}</span></div></motion.button>;
@@ -407,58 +883,209 @@ export default function App() {
 
   // ─── Render: Landing ───────────────────────────────────────────────────
   function renderLanding() {
-    return <motion.section key="landing" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className={cn("relative min-h-screen overflow-hidden px-5 py-6", landingShake ? "screen-shake" : "")}><div className="absolute inset-0"><TacticalMap incidents={incidents} selectedIncident={selectedIncident} onSelect={setSelectedIncident} className="h-full min-h-screen rounded-none border-0 opacity-45" title="National Live Grid" /><div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(11,18,32,0.52),rgba(11,18,32,0.92)_58%,#0B1220_100%)]" /></div><div className="relative z-10 mx-auto flex min-h-[calc(100vh-3rem)] max-w-7xl flex-col"><header className="flex flex-col gap-4 py-2 md:flex-row md:items-center md:justify-between"><div className="flex items-center gap-3"><span className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[#3B82F6]/30 bg-[#3B82F6]/16 shadow-[0_0_34px_rgba(59,130,246,0.32)]"><Shield className="h-7 w-7 text-[#3B82F6]" /></span><div><p className="text-lg font-black tracking-[0.22em] text-white">SAFE LANKA</p><p className="text-xs font-bold uppercase tracking-[0.26em] text-[#AAB4C5]">Emergency command system</p></div></div><div className="flex flex-wrap items-center gap-3 rounded-full border border-white/10 bg-[#0B1220]/58 px-4 py-2 backdrop-blur-xl"><span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[#34C759] shadow-[0_0_18px_#34C759]" /><span className="text-sm font-semibold text-white">Live status ticker</span><span className="text-sm text-[#AAB4C5]">{stats.active} active disasters</span><span className="hidden text-sm text-[#AAB4C5] sm:inline">{stats.availableTeams} rescue teams available</span></div></header><main className="grid flex-1 place-items-center py-16 text-center"><motion.div initial={{ opacity: 0, y: 26 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.7, ease: "easeOut" }} className="max-w-5xl"><motion.p animate={{ opacity: [0.55, 1, 0.55] }} transition={{ duration: 2.4, repeat: Infinity }} className="mb-5 text-sm font-bold uppercase tracking-[0.45em] text-[#3B82F6]">National response grid online</motion.p><h1 className="text-6xl font-black tracking-[-0.08em] text-white drop-shadow-[0_0_35px_rgba(59,130,246,0.34)] sm:text-7xl md:text-9xl">SAFE LANKA</h1><h2 className="mt-5 text-2xl font-bold text-white md:text-4xl">Real-time Emergency Response System</h2><p className="mx-auto mt-5 max-w-3xl text-base leading-7 text-[#AAB4C5] md:text-lg">Citizens report emergencies, government admins assign rescue teams, and field units update every mission through live maps, instant alerts, and analytics.</p><div className="mt-10 flex flex-col justify-center gap-4 sm:flex-row"><IconButton variant="red" onClick={openReportFlow} className="heartbeat px-7 py-4 text-base"><AlertTriangle className="h-5 w-5" /> Report Emergency</IconButton><IconButton variant="blue" onClick={() => go("publicMap")} className="px-7 py-4 text-base"><MapIcon className="h-5 w-5" /> Live Disaster Map</IconButton><IconButton variant="gray" onClick={() => setLoginOpen(true)} className="px-7 py-4 text-base"><LogIn className="h-5 w-5" /> Login</IconButton></div></motion.div></main></div></motion.section>;
+    return <motion.section key="landing" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className={cn("relative min-h-screen overflow-hidden px-5 py-6", landingShake ? "screen-shake" : "")}><div className="pointer-events-none absolute inset-0"><DisasterMap incidents={incidents} shelters={shelters} selectedIncident={null} onSelect={() => undefined} className="h-full min-h-screen rounded-none border-0 opacity-45" title="National Live Grid" showDetailPanel={false} /><div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(11,18,32,0.52),rgba(11,18,32,0.92)_58%,#0B1220_100%)]" /></div><div className="relative z-10 mx-auto flex min-h-[calc(100vh-3rem)] max-w-7xl flex-col"><header className="flex flex-col gap-4 py-2 md:flex-row md:items-center md:justify-between"><div className="flex items-center gap-3"><span className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[#3B82F6]/30 bg-[#3B82F6]/16 shadow-[0_0_34px_rgba(59,130,246,0.32)]"><Shield className="h-7 w-7 text-[#3B82F6]" /></span><div><p className="text-lg font-black tracking-[0.22em] text-white">SAFE LANKA</p><p className="text-xs font-bold uppercase tracking-[0.26em] text-[#AAB4C5]">Emergency command system</p></div></div><div className="flex flex-wrap items-center gap-3 rounded-full border border-white/10 bg-[#0B1220]/58 px-4 py-2 backdrop-blur-xl"><span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[#34C759] shadow-[0_0_18px_#34C759]" /><span className="text-sm font-semibold text-white">Live status ticker</span><span className="text-sm text-[#AAB4C5]">{stats.active} active disasters</span><span className="hidden text-sm text-[#AAB4C5] sm:inline">{stats.availableTeams} rescue teams available</span></div></header><main className="grid flex-1 place-items-center py-16 text-center"><motion.div initial={{ opacity: 0, y: 26 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.7, ease: "easeOut" }} className="max-w-5xl"><motion.p animate={{ opacity: [0.55, 1, 0.55] }} transition={{ duration: 2.4, repeat: Infinity }} className="mb-5 text-sm font-bold uppercase tracking-[0.45em] text-[#3B82F6]">National response grid online</motion.p><h1 className="text-6xl font-black tracking-[-0.08em] text-white drop-shadow-[0_0_35px_rgba(59,130,246,0.34)] sm:text-7xl md:text-9xl">SAFE LANKA</h1><h2 className="mt-5 text-2xl font-bold text-white md:text-4xl">Real-time Emergency Response System</h2><p className="mx-auto mt-5 max-w-3xl text-base leading-7 text-[#AAB4C5] md:text-lg">Citizens report emergencies, government admins assign rescue teams, and field units update every mission through live maps, instant alerts, and analytics.</p><div className="mt-10 flex flex-col justify-center gap-4 sm:flex-row"><IconButton variant="red" onClick={openReportFlow} className="heartbeat px-7 py-4 text-base"><AlertTriangle className="h-5 w-5" /> Report Emergency</IconButton><IconButton variant="blue" onClick={() => go("publicMap")} className="px-7 py-4 text-base"><MapIcon className="h-5 w-5" /> Live Disaster Map</IconButton>{auth.isAuthenticated ? (<><IconButton variant="blue" onClick={() => go(homePageForRole(auth.role))} className="px-7 py-4 text-base"><Shield className="h-5 w-5" /> My panel</IconButton><IconButton variant="gray" onClick={handleLogout} className="px-7 py-4 text-base"><LogOut className="h-5 w-5" /> Logout</IconButton></>) : (<IconButton variant="gray" onClick={() => setLoginOpen(true)} className="px-7 py-4 text-base"><LogIn className="h-5 w-5" /> Login</IconButton>)}</div></motion.div></main></div></motion.section>;
   }
 
   // ─── Render: Citizen ───────────────────────────────────────────────────
   function renderCitizenHome() {
-    return <div className="grid gap-5 xl:grid-cols-[1.05fr_0.95fr]"><motion.button type="button" whileHover={{ scale: 1.015 }} whileTap={{ scale: 0.99 }} onClick={() => setCitizenTab("report")} className="relative overflow-hidden rounded-[2rem] border border-[#FF3B30]/35 bg-gradient-to-br from-[#FF3B30]/24 to-[#111C2E]/90 p-8 text-left shadow-[0_0_55px_rgba(255,59,48,0.2)]"><div className="absolute -right-16 -top-16 h-56 w-56 rounded-full bg-[#FF3B30]/20 blur-3xl" /><div className="relative z-10 max-w-xl"><div className="mb-6 flex h-16 w-16 items-center justify-center rounded-3xl bg-[#FF3B30]/22 shadow-[0_0_34px_rgba(255,59,48,0.32)]"><Siren className="h-9 w-9 text-[#FF6B63]" /></div><p className="text-sm font-bold uppercase tracking-[0.26em] text-[#FF8A83]">One tap emergency</p><h2 className="mt-3 text-4xl font-black text-white md:text-5xl">Report Emergency</h2><p className="mt-4 text-base leading-7 text-[#FFD2CF]">GPS, severity, media, ticket creation, admin alert, and rescue notification in one flow.</p></div></motion.button><div className="grid gap-5"><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><div className="mb-5 flex items-center justify-between"><h3 className="text-xl font-black">Active alerts near me</h3><SeverityBadge severity="Critical" /></div><div className="grid gap-3">{incidents.slice(0, 3).map((inc) => <button key={inc.id} type="button" onClick={() => { setSelectedIncident(inc); setCitizenTab("map"); }} className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-[#3B82F6]/40 hover:bg-white/8"><div><p className="font-bold text-white">{inc.type}</p><p className="mt-1 text-sm text-[#AAB4C5]">{inc.location}</p></div><SeverityBadge severity={inc.severity} /></button>)}</div></div><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><h3 className="text-xl font-black">Nearby shelters</h3><div className="mt-5 grid gap-4">{shelters.slice(0, 2).map((s) => <ShelterRow key={s.id} shelter={s} />)}</div></div></div><TacticalMap incidents={incidents} selectedIncident={selectedIncident} onSelect={setSelectedIncident} className="xl:col-span-2" /></div>;
+    return <div className="grid gap-5 xl:grid-cols-[1.05fr_0.95fr]"><motion.button type="button" whileHover={{ scale: 1.015 }} whileTap={{ scale: 0.99 }} onClick={() => setCitizenTab("report")} className="relative overflow-hidden rounded-[2rem] border border-[#FF3B30]/35 bg-gradient-to-br from-[#FF3B30]/24 to-[#111C2E]/90 p-8 text-left shadow-[0_0_55px_rgba(255,59,48,0.2)]"><div className="absolute -right-16 -top-16 h-56 w-56 rounded-full bg-[#FF3B30]/20 blur-3xl" /><div className="relative z-10 max-w-xl"><div className="mb-6 flex h-16 w-16 items-center justify-center rounded-3xl bg-[#FF3B30]/22 shadow-[0_0_34px_rgba(255,59,48,0.32)]"><Siren className="h-9 w-9 text-[#FF6B63]" /></div><p className="text-sm font-bold uppercase tracking-[0.26em] text-[#FF8A83]">One tap emergency</p><h2 className="mt-3 text-4xl font-black text-white md:text-5xl">Report Emergency</h2><p className="mt-4 text-base leading-7 text-[#FFD2CF]">GPS, severity, media, ticket creation, admin alert, and rescue notification in one flow.</p></div></motion.button><div className="grid gap-5"><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><div className="mb-5 flex items-center justify-between"><h3 className="text-xl font-black">Active alerts near me</h3><SeverityBadge severity="Critical" /></div><div className="grid gap-3">{incidents.slice(0, 3).map((inc) => <button key={inc.id} type="button" onClick={() => { setSelectedIncident(inc); setCitizenTab("map"); }} className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-[#3B82F6]/40 hover:bg-white/8"><div><p className="font-bold text-white">{inc.type}</p><p className="mt-1 text-sm text-[#AAB4C5]">{inc.location}</p></div><SeverityBadge severity={inc.severity} /></button>)}</div></div><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><h3 className="text-xl font-black">Nearby shelters</h3><div className="mt-5 grid gap-4">{shelters.slice(0, 2).map((s) => <ShelterRow key={s.id} shelter={s} />)}</div></div></div><DisasterMap incidents={incidents} shelters={shelters} selectedIncident={selectedIncident} onSelect={(inc) => setSelectedIncident(mapIncidentToFull(inc))} className="xl:col-span-2" /></div>;
   }
   function renderReportForm() {
-    return <div className="grid gap-5 xl:grid-cols-[0.92fr_1.08fr]"><form onSubmit={submitEmergency} className="rounded-[2rem] border border-[#FF3B30]/25 bg-[#111C2E]/82 p-6 shadow-[0_0_48px_rgba(255,59,48,0.13)] backdrop-blur-2xl"><div className="mb-6 flex items-center gap-4"><div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[#FF3B30]/18"><AlertTriangle className="h-7 w-7 text-[#FF3B30]" /></div><div><p className="text-xs font-bold uppercase tracking-[0.24em] text-[#FF8A83]">Citizen emergency report</p><h2 className="mt-1 text-2xl font-black text-white">Create rescue ticket</h2></div></div><div className="grid gap-4"><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">GPS location</span><button type="button" onClick={detectGPS} className="flex items-center gap-3 rounded-2xl border border-[#34C759]/25 bg-[#34C759]/8 px-4 py-3 text-sm text-white hover:bg-[#34C759]/15 transition"><Crosshair className="h-4 w-4 text-[#34C759]" />{reportForm.gpsLocation}</button></label><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Manual location override</span><input value={reportForm.manualLocation} onChange={(e) => setReportForm((c) => ({ ...c, manualLocation: e.target.value }))} placeholder="Example: Near Kelani bridge, Colombo" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none transition placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Disaster type</span><select value={reportForm.type} onChange={(e) => setReportForm((c) => ({ ...c, type: e.target.value }))} className="rounded-2xl border border-white/10 bg-[#16243A] px-4 py-3 text-white outline-none focus:border-[#3B82F6]/60">{disasterTypes.map((t) => <option key={t}>{t}</option>)}</select></label><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Severity</span><select value={reportForm.severity} onChange={(e) => setReportForm((c) => ({ ...c, severity: e.target.value as Severity }))} className="rounded-2xl border border-white/10 bg-[#16243A] px-4 py-3 text-white outline-none focus:border-[#3B82F6]/60">{severityOptions.map((s) => <option key={s}>{s}</option>)}</select></label></div><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Description</span><textarea value={reportForm.description} onChange={(e) => setReportForm((c) => ({ ...c, description: e.target.value }))} placeholder="Tell the admin what happened." rows={5} className="resize-none rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none transition placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /></label><label className="grid cursor-pointer gap-2 rounded-2xl border border-dashed border-white/15 bg-white/5 p-4 transition hover:border-[#3B82F6]/50"><span className="flex items-center gap-2 text-sm font-semibold text-[#AAB4C5]"><Upload className="h-4 w-4" />Image or video upload</span><input type="file" accept="image/*,video/*" className="text-sm text-[#AAB4C5] file:mr-4 file:rounded-full file:border-0 file:bg-[#3B82F6] file:px-4 file:py-2 file:text-sm file:font-bold file:text-white" onChange={(e) => { setMediaFile(e.target.files?.[0] ?? null); setReportForm((c) => ({ ...c, media: e.target.files?.[0]?.name ?? "" })); }} />{reportForm.media ? <span className="text-xs text-[#34C759]">Ready: {reportForm.media}</span> : null}</label><IconButton type="submit" variant="red" className="mt-2 py-4 text-base">{submitting ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" /> Sending...</> : <><Send className="h-5 w-5" /> Submit Emergency</>}</IconButton></div></form><div className="grid gap-5"><div className="rounded-[2rem] border border-[#34C759]/25 bg-[#10251B]/70 p-6 backdrop-blur-2xl"><div className="flex items-start gap-4"><CheckCircle2 className="mt-1 h-7 w-7 text-[#34C759]" /><div><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#86EFAC]">Citizen confirmation</p><h3 className="mt-2 text-2xl font-black text-white">Your emergency is registered</h3><p className="mt-2 text-sm text-[#AAB4C5]">Latest ticket: <span className="font-bold text-white">{latestTicket}</span></p></div></div></div><TacticalMap incidents={incidents} selectedIncident={selectedIncident} onSelect={setSelectedIncident} className="min-h-[520px]" title="Instant marker preview" /></div></div>;
+    return <div className="grid gap-5 xl:grid-cols-[0.92fr_1.08fr]"><form onSubmit={submitEmergency} className="rounded-[2rem] border border-[#FF3B30]/25 bg-[#111C2E]/82 p-6 shadow-[0_0_48px_rgba(255,59,48,0.13)] backdrop-blur-2xl"><div className="mb-6 flex items-center gap-4"><div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[#FF3B30]/18"><AlertTriangle className="h-7 w-7 text-[#FF3B30]" /></div><div><p className="text-xs font-bold uppercase tracking-[0.24em] text-[#FF8A83]">Citizen emergency report</p><h2 className="mt-1 text-2xl font-black text-white">Create rescue ticket</h2></div></div>{reportError ? <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="mb-4 flex items-start gap-3 rounded-2xl border border-[#FF3B30]/40 bg-[#2A1118]/90 p-4"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-[#FF3B30]" /><div className="flex-1"><p className="text-sm font-semibold leading-5 text-[#FFD2CF]">{reportError}</p></div><button type="button" onClick={() => setReportError("")} className="shrink-0 rounded-full p-1 text-[#FF8A83] opacity-60 transition hover:opacity-100"><X className="h-3.5 w-3.5" /></button></motion.div> : null}<div className="grid gap-4"><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">GPS location</span><button type="button" onClick={detectGPS} className="flex items-center gap-3 rounded-2xl border border-[#34C759]/25 bg-[#34C759]/8 px-4 py-3 text-sm text-white hover:bg-[#34C759]/15 transition"><Crosshair className="h-4 w-4 text-[#34C759]" />{reportForm.gpsLocation}</button></label><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Manual location override</span><input value={reportForm.manualLocation} onChange={(e) => setReportForm((c) => ({ ...c, manualLocation: e.target.value }))} placeholder="Example: Near Kelani bridge, Colombo" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none transition placeholder:text-[#6B7A90] focus:border-[#3B82F6] focus:shadow-[0_0_15px_rgba(59,130,246,0.25)]" /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Disaster type</span><select value={reportForm.type} onChange={(e) => setReportForm((c) => ({ ...c, type: e.target.value }))} className="rounded-2xl border border-white/10 bg-[#16243A] px-4 py-3 text-white outline-none focus:border-[#3B82F6]/60">{disasterTypes.map((t) => <option key={t}>{t}</option>)}</select></label><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Severity</span><select value={reportForm.severity} onChange={(e) => setReportForm((c) => ({ ...c, severity: e.target.value as Severity }))} className="rounded-2xl border border-white/10 bg-[#16243A] px-4 py-3 text-white outline-none focus:border-[#3B82F6]/60">{severityOptions.map((s) => <option key={s}>{s}</option>)}</select></label></div><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Description</span><textarea value={reportForm.description} onChange={(e) => setReportForm((c) => ({ ...c, description: e.target.value }))} placeholder="மீட்புக் குழுவினருக்குத் தேவையான கூடுதல் விவரங்களை இங்கே விளக்கவும் (e.g. வெள்ளத்தின் அளவு, சிக்கியுள்ள நபர்களின் எண்ணிக்கை...)" rows={5} className="resize-none rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none transition placeholder:text-[#6B7A90] focus:border-[#3B82F6] focus:shadow-[0_0_15px_rgba(59,130,246,0.25)]" /></label><label className="grid cursor-pointer gap-2 rounded-2xl border border-dashed border-white/15 bg-white/5 p-4 transition hover:border-[#3B82F6]/50"><span className="flex items-center gap-2 text-sm font-semibold text-[#AAB4C5]"><Upload className="h-4 w-4" />Image or video upload</span><input type="file" accept="image/*,video/*" className="text-sm text-[#AAB4C5] file:mr-4 file:rounded-full file:border-0 file:bg-[#3B82F6] file:px-4 file:py-2 file:text-sm file:font-bold file:text-white" onChange={(e) => { setMediaFile(e.target.files?.[0] ?? null); setReportForm((c) => ({ ...c, media: e.target.files?.[0]?.name ?? "" })); }} />{reportForm.media ? <span className="text-xs text-[#34C759]">Ready: {reportForm.media}</span> : null}</label><IconButton type="submit" variant="red" className="mt-2 py-4 text-base">{submitting ? <><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" /> Sending...</> : <><Send className="h-5 w-5" /> Submit Emergency</>}</IconButton></div></form><div className="grid gap-5"><div className="rounded-[2rem] border border-[#34C759]/25 bg-[#10251B]/70 p-6 backdrop-blur-2xl"><div className="flex items-start gap-4"><CheckCircle2 className="mt-1 h-7 w-7 text-[#34C759]" /><div><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#86EFAC]">Citizen confirmation</p><h3 className="mt-2 text-2xl font-black text-white">Your emergency is registered</h3><p className="mt-2 text-sm text-[#AAB4C5]">Latest ticket: <span className="font-bold text-white">{latestTicket}</span></p></div></div></div><DisasterMap incidents={incidents} shelters={shelters} selectedIncident={selectedIncident} onSelect={(inc) => setSelectedIncident(mapIncidentToFull(inc))} className="min-h-[520px]" title="Instant marker preview" /></div></div>;
   }
-  function renderCitizenMap() { return <div className="grid gap-5 xl:grid-cols-[1fr_360px]"><TacticalMap incidents={incidents} selectedIncident={selectedIncident} onSelect={setSelectedIncident} className="min-h-[680px]" /><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/78 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Read-only public map</p><h2 className="mt-2 text-2xl font-black">Live incident popups</h2><p className="mt-3 text-sm leading-6 text-[#AAB4C5]">Click a marker to see details. Critical markers pulse faster.</p><div className="mt-6 grid gap-3">{incidents.map((inc) => <button key={inc.id} type="button" onClick={() => setSelectedIncident(inc)} className="rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-[#3B82F6]/40"><div className="flex items-center justify-between gap-3"><div><p className="font-bold text-white">{inc.id} - {inc.type}</p><p className="mt-1 text-xs text-[#AAB4C5]">{inc.time}</p></div><StatusBadge status={inc.status} /></div></button>)}</div></div></div>; }
+  function renderCitizenMap() { return <div className="grid gap-5 xl:grid-cols-[1fr_360px]"><DisasterMap incidents={incidents} shelters={shelters} selectedIncident={selectedIncident} onSelect={(inc) => setSelectedIncident(mapIncidentToFull(inc))} className="min-h-[680px]" /><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/78 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Read-only public map</p><h2 className="mt-2 text-2xl font-black">Live incident popups</h2><p className="mt-3 text-sm leading-6 text-[#AAB4C5]">Click a marker to see details. Critical markers pulse faster.</p><div className="mt-6 grid gap-3">{incidents.map((inc) => <button key={inc.id} type="button" onClick={() => setSelectedIncident(inc)} className="rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-[#3B82F6]/40"><div className="flex items-center justify-between gap-3"><div><p className="font-bold text-white">{inc.id} - {inc.type}</p><p className="mt-1 text-xs text-[#AAB4C5]">{inc.time}</p></div><StatusBadge status={inc.status} /></div></button>)}</div></div></div>; }
   function renderCitizenReports() { return <div className="grid gap-5 lg:grid-cols-2">{incidents.map((inc) => <IncidentSummary key={inc.id} incident={inc} onClick={() => setSelectedIncident(inc)} />)}<div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 text-[#AAB4C5] backdrop-blur-2xl"><Bell className="mb-4 h-8 w-8 text-[#3B82F6]" /><h3 className="text-2xl font-black text-white">Notifications</h3><p className="mt-3 leading-7">Updates arrive when admin assigns a team or rescue updates status.</p></div></div>; }
-  function renderShelterList(adminMode: boolean) { return <div className="grid gap-5 xl:grid-cols-[1fr_0.75fr]"><div className="grid gap-4">{shelters.map((s) => <ShelterRow key={s.id} shelter={s} />)}</div>{adminMode ? <form onSubmit={addShelter} className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Shelter registry</p><h2 className="mt-2 text-2xl font-black text-white">Add shelter</h2><div className="mt-6 grid gap-4"><input value={shelterForm.name} onChange={(e) => setShelterForm((c) => ({ ...c, name: e.target.value }))} placeholder="Shelter name" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={shelterForm.location} onChange={(e) => setShelterForm((c) => ({ ...c, location: e.target.value }))} placeholder="Location" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><div className="grid gap-4 sm:grid-cols-2"><input value={shelterForm.capacity} onChange={(e) => setShelterForm((c) => ({ ...c, capacity: e.target.value }))} placeholder="Capacity" type="number" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={shelterForm.beds} onChange={(e) => setShelterForm((c) => ({ ...c, beds: e.target.value }))} placeholder="Available beds" type="number" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /></div><input value={shelterForm.contact} onChange={(e) => setShelterForm((c) => ({ ...c, contact: e.target.value }))} placeholder="Contact number" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><IconButton type="submit" variant="green"><Building2 className="h-4 w-4" /> Add Shelter</IconButton></div></form> : <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><Building2 className="mb-4 h-9 w-9 text-[#34C759]" /><h2 className="text-2xl font-black text-white">Safe shelter guidance</h2><p className="mt-3 leading-7 text-[#AAB4C5]">Choose a nearby shelter with available beds.</p></div>}</div>; }
+  function renderShelterList(adminMode: boolean) {
+    return (
+      <div className="grid gap-5 xl:grid-cols-[1fr_0.75fr]">
+        <div className="grid gap-4">
+          {shelters.map((s) => (
+            <ShelterRow
+              key={s.id}
+              shelter={s}
+              adminMode={adminMode}
+              onEdit={adminMode ? () => startEditShelter(s) : undefined}
+              onDelete={adminMode ? () => deleteShelter(s) : undefined}
+            />
+          ))}
+        </div>
+        {adminMode ? (
+          <form onSubmit={saveShelter} className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl">
+            <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Shelter registry</p>
+            <h2 className="mt-2 text-2xl font-black text-white">{editingShelterId ? "Edit shelter" : "Add shelter"}</h2>
+            <div className="mt-6 grid gap-4">
+              <input value={shelterForm.name} onChange={(e) => setShelterForm((c) => ({ ...c, name: e.target.value }))} placeholder="Shelter name" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+              <input value={shelterForm.location} onChange={(e) => setShelterForm((c) => ({ ...c, location: e.target.value }))} placeholder="Location" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+              <div className="grid gap-4 sm:grid-cols-2">
+                <input value={shelterForm.capacity} onChange={(e) => setShelterForm((c) => ({ ...c, capacity: e.target.value }))} placeholder="Capacity" type="number" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+                <input value={shelterForm.beds} onChange={(e) => setShelterForm((c) => ({ ...c, beds: e.target.value }))} placeholder="Available beds" type="number" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+              </div>
+              <input value={shelterForm.contact} onChange={(e) => setShelterForm((c) => ({ ...c, contact: e.target.value }))} placeholder="Contact number" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+              <div className="flex flex-wrap gap-3">
+                <IconButton type="submit" variant="green"><Building2 className="h-4 w-4" /> {editingShelterId ? "Save changes" : "Add shelter"}</IconButton>
+                {editingShelterId ? <IconButton type="button" variant="gray" onClick={resetShelterForm}>Cancel</IconButton> : null}
+              </div>
+            </div>
+          </form>
+        ) : (
+          <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl">
+            <Building2 className="mb-4 h-9 w-9 text-[#34C759]" />
+            <h2 className="text-2xl font-black text-white">Safe shelter guidance</h2>
+            <p className="mt-3 leading-7 text-[#AAB4C5]">Choose a nearby shelter with available beds.</p>
+          </div>
+        )}
+      </div>
+    );
+  }
   function renderCitizen() {
     const sb = <><SidebarButton label="Home" icon={<Home className="h-4 w-4" />} active={citizenTab === "home"} onClick={() => setCitizenTab("home")} /><SidebarButton label="Report Emergency" icon={<Siren className="h-4 w-4" />} active={citizenTab === "report"} onClick={() => setCitizenTab("report")} /><SidebarButton label="Live Map" icon={<MapIcon className="h-4 w-4" />} active={citizenTab === "map"} onClick={() => setCitizenTab("map")} /><SidebarButton label="My Reports" icon={<Activity className="h-4 w-4" />} active={citizenTab === "reports"} onClick={() => setCitizenTab("reports")} /><SidebarButton label="Nearby Shelters" icon={<Building2 className="h-4 w-4" />} active={citizenTab === "shelters"} onClick={() => setCitizenTab("shelters")} /></>;
-    return <OperationalShell title="Citizen Emergency Panel" subtitle="Fast reporting, live alerts near you, and safe shelter discovery." sidebar={sb} onExit={() => go("landing")} signalLabel="Public safety channel">{citizenTab === "home" ? renderCitizenHome() : null}{citizenTab === "report" ? renderReportForm() : null}{citizenTab === "map" ? renderCitizenMap() : null}{citizenTab === "reports" ? renderCitizenReports() : null}{citizenTab === "shelters" ? renderShelterList(false) : null}</OperationalShell>;
+    return <OperationalShell title="Citizen Emergency Panel" subtitle="Fast reporting, live alerts near you, and safe shelter discovery." sidebar={sb} onExit={() => go("landing")} signalLabel="Public safety channel" onRefresh={handleManualRefresh} isRefreshing={isRefreshing} {...shellAuthProps}>{citizenTab === "home" ? renderCitizenHome() : null}{citizenTab === "report" ? renderReportForm() : null}{citizenTab === "map" ? renderCitizenMap() : null}{citizenTab === "reports" ? renderCitizenReports() : null}{citizenTab === "shelters" ? renderShelterList(false) : null}</OperationalShell>;
   }
 
   // ─── Render: Admin ─────────────────────────────────────────────────────
   function renderAdminDashboard() { return <div className="grid gap-5"><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4"><MetricTile icon={<Radio className="h-6 w-6" />} label="Total incidents" value={stats.total} tone="blue" /><MetricTile icon={<AlertTriangle className="h-6 w-6" />} label="Active emergencies" value={stats.active} tone="red" /><MetricTile icon={<CheckCircle2 className="h-6 w-6" />} label="Resolved cases" value={stats.resolved} tone="green" /><MetricTile icon={<Ambulance className="h-6 w-6" />} label="Teams available" value={stats.availableTeams} tone="yellow" /></div><div className="grid gap-5 xl:grid-cols-[0.95fr_1.05fr]"><BarAnalytics data={stats.typeCounts} /><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><div className="mb-5 flex items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">Active queue</p><h3 className="mt-2 text-xl font-black text-white">Incident management panel</h3></div><IconButton variant="blue" onClick={() => setAdminTab("incidents")} className="px-4 py-2"><MapIcon className="h-4 w-4" /> Open</IconButton></div><div className="grid gap-3">{incidents.slice(0, 4).map((inc) => <IncidentRow key={inc.id} incident={inc} />)}</div></div></div></div>; }
-  function renderAdminIncidents() { return <div className="grid gap-5 xl:grid-cols-[0.92fr_1.08fr]"><div className="grid gap-4">{incidents.map((inc) => <IncidentSummary key={inc.id} incident={inc} onClick={() => setSelectedIncident(inc)} />)}</div><TacticalMap incidents={incidents} selectedIncident={selectedIncident} onSelect={setSelectedIncident} className="sticky top-6 min-h-[720px]" showRoute={Boolean(selectedIncident?.assignedTeamId)} title="Admin map preview" /></div>; }
+  function renderAdminIncidents() { return <div className="grid gap-5 xl:grid-cols-[0.92fr_1.08fr]"><div className="grid gap-4">{incidents.map((inc) => <IncidentSummary key={inc.id} incident={inc} onClick={() => setSelectedIncident(inc)} />)}</div><DisasterMap incidents={incidents} shelters={shelters} selectedIncident={selectedIncident} onSelect={(inc) => setSelectedIncident(mapIncidentToFull(inc))} className="sticky top-6 min-h-[720px]" showRoute={Boolean(selectedIncident?.assignedTeamId)} title="Admin map preview" /></div>; }
   function renderIncidentDrawer() {
     if (!selectedIncident) return null;
     const at = teams.find((t) => t.id === selectedIncident.assignedTeamId);
     return <AnimatePresence><motion.aside initial={{ x: 420, opacity: 0 }} animate={{ x: 0, opacity: 1 }} exit={{ x: 420, opacity: 0 }} className="fixed bottom-4 right-4 top-4 z-40 w-[min(440px,calc(100vw-2rem))] overflow-y-auto rounded-[2rem] border border-white/10 bg-[#111C2E]/92 p-6 shadow-2xl backdrop-blur-2xl custom-scrollbar"><div className="mb-6 flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Incident details</p><h2 className="mt-2 text-3xl font-black text-white">{selectedIncident.id}</h2></div><button type="button" onClick={() => setSelectedIncident(null)} className="rounded-full border border-white/10 bg-white/8 p-2 text-[#AAB4C5] transition hover:text-white"><X className="h-5 w-5" /></button></div><div className="grid gap-4"><div className="rounded-2xl border border-white/10 bg-white/5 p-4"><div className="flex items-center justify-between gap-3"><h3 className="text-xl font-black">{selectedIncident.type}</h3><SeverityBadge severity={selectedIncident.severity} /></div><p className="mt-3 text-sm leading-6 text-[#AAB4C5]">{selectedIncident.description}</p><div className="mt-4 flex flex-wrap gap-2"><StatusBadge status={selectedIncident.status} />{at ? <span className="rounded-full border border-[#3B82F6]/30 bg-[#3B82F6]/10 px-3 py-1 text-xs font-bold text-[#93C5FD]">{at.name}</span> : null}</div></div><div className="rounded-2xl border border-white/10 bg-white/5 p-4"><h4 className="font-bold text-white">Citizen info</h4><div className="mt-3 grid gap-2 text-sm text-[#AAB4C5]"><div className="flex items-center gap-2"><Users className="h-4 w-4" />{selectedIncident.citizen.name}</div><div className="flex items-center gap-2"><PhoneCall className="h-4 w-4" />{selectedIncident.citizen.phone || "N/A"}</div><div className="flex items-center gap-2"><Mail className="h-4 w-4" />{selectedIncident.citizen.email || "N/A"}</div><div className="flex items-center gap-2"><MapPin className="h-4 w-4" />{selectedIncident.location}</div></div></div><div className="rounded-2xl border border-white/10 bg-white/5 p-4"><h4 className="font-bold text-white">Timeline</h4><div className="mt-4 grid gap-3">{selectedIncident.timeline.map((item) => <div key={`${item.label}-${item.time}`} className="flex gap-3 text-sm"><span className="mt-1.5 h-2 w-2 rounded-full bg-[#3B82F6] shadow-[0_0_12px_#3B82F6]" /><div><p className="text-white">{item.label}</p><p className="text-xs text-[#6B7A90]">{item.time}</p></div></div>)}</div></div><div className="grid gap-3"><IconButton variant="blue" onClick={() => { setSelectedTeamId(teams.find((t) => t.status === "Available")?.id ?? teams[0]?.id ?? ""); setAssignOpen(true); }}><Ambulance className="h-4 w-4" /> Assign Rescue Team</IconButton><IconButton variant="gray" onClick={() => setIncidentStatus(selectedIncident, "In Progress")}><Zap className="h-4 w-4" /> Mark in Progress</IconButton><IconButton variant="green" onClick={closeSelectedCase}><CheckCircle2 className="h-4 w-4" /> Close Case</IconButton></div></div></motion.aside></AnimatePresence>;
   }
-  function renderAssignTeams() { return <div className="grid gap-5 xl:grid-cols-[0.82fr_1.18fr]"><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Dispatch console</p><h2 className="mt-2 text-2xl font-black text-white">Rescue teams</h2><div className="mt-6 grid gap-3">{teams.map((t) => <button key={t.id} type="button" onClick={() => setSelectedTeamId(t.id)} className={cn("rounded-2xl border p-4 text-left transition", selectedTeamId === t.id ? "border-[#3B82F6]/60 bg-[#3B82F6]/12" : "border-white/10 bg-white/5 hover:border-[#34C759]/35")}><div className="flex items-start justify-between gap-4"><div><p className="font-bold text-white">{t.name}</p><p className="mt-1 text-sm text-[#AAB4C5]">{t.station} - {t.distance} - ETA {t.eta}</p></div><span className={cn("rounded-full border px-3 py-1 text-xs font-bold", t.status === "Available" ? "border-[#34C759]/30 bg-[#34C759]/10 text-[#86EFAC]" : "border-[#FFD60A]/30 bg-[#FFD60A]/10 text-[#FFE16A]")}>{t.status}</span></div></button>)}</div></div><div className="grid gap-5"><TacticalMap incidents={incidents} selectedIncident={selectedIncident} onSelect={setSelectedIncident} className="min-h-[520px]" showRoute={Boolean(selectedIncident)} title="Assignment route map" /><IconButton variant="blue" onClick={() => setAssignOpen(true)} className="py-4"><Route className="h-5 w-5" /> Assign selected team</IconButton></div></div>; }
-  function renderAnalytics() { return <div className="grid gap-5 xl:grid-cols-2"><BarAnalytics data={stats.typeCounts} /><HeatMapPanel incidents={incidents} /><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">Response time</p><h3 className="mt-2 text-2xl font-black text-white">Average: 11.4 min</h3><div className="mt-8 grid gap-4">{[78, 64, 89, 52, 71].map((v, i) => <div key={v} className="flex items-center gap-4"><span className="w-16 text-sm text-[#AAB4C5]">Zone {i + 1}</span><div className="h-3 flex-1 overflow-hidden rounded-full bg-white/8"><motion.div initial={{ width: 0 }} animate={{ width: `${v}%` }} transition={{ duration: 0.8, delay: i * 0.08 }} className="h-full rounded-full bg-[#3B82F6] shadow-[0_0_18px_rgba(59,130,246,0.7)]" /></div><span className="w-10 text-right text-sm font-bold text-white">{v}%</span></div>)}</div></div><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">Team performance</p><h3 className="mt-2 text-2xl font-black text-white">Field unit availability</h3><div className="mt-6 grid gap-3">{teams.map((t) => <div key={t.id} className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 p-4"><div><p className="font-bold text-white">{t.name}</p><p className="text-sm text-[#AAB4C5]">{t.members} members - ETA {t.eta}</p></div><span className="text-sm font-bold text-[#86EFAC]">{t.status}</span></div>)}</div></div></div>; }
+  function renderAssignTeams() { return <div className="grid gap-5 xl:grid-cols-[0.82fr_1.18fr]"><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Dispatch console</p><h2 className="mt-2 text-2xl font-black text-white">Rescue teams</h2><div className="mt-6 grid gap-3">{teams.map((t) => <button key={t.id} type="button" onClick={() => setSelectedTeamId(t.id)} className={cn("rounded-2xl border p-4 text-left transition", selectedTeamId === t.id ? "border-[#3B82F6]/60 bg-[#3B82F6]/12" : "border-white/10 bg-white/5 hover:border-[#34C759]/35")}><div className="flex items-start justify-between gap-4"><div><p className="font-bold text-white">{t.name}</p><p className="mt-1 text-sm text-[#AAB4C5]">{t.station} - {t.distance} - ETA {t.eta}</p></div><span className={cn("rounded-full border px-3 py-1 text-xs font-bold", t.status === "Available" ? "border-[#34C759]/30 bg-[#34C759]/10 text-[#86EFAC]" : "border-[#FFD60A]/30 bg-[#FFD60A]/10 text-[#FFE16A]")}>{t.status}</span></div></button>)}</div></div><div className="grid gap-5"><DisasterMap incidents={incidents} shelters={shelters} selectedIncident={selectedIncident} onSelect={(inc) => setSelectedIncident(mapIncidentToFull(inc))} className="min-h-[520px]" showRoute={Boolean(selectedIncident)} title="Assignment route map" /><IconButton variant="blue" onClick={() => setAssignOpen(true)} className="py-4"><Route className="h-5 w-5" /> Assign selected team</IconButton></div></div>; }
+  function renderAnalytics() { return <div className="grid gap-5 xl:grid-cols-2"><BarAnalytics data={stats.typeCounts} /><HeatMapPanel incidents={incidents} shelters={shelters} /><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">Response time</p><h3 className="mt-2 text-2xl font-black text-white">Average: 11.4 min</h3><div className="mt-8 grid gap-4">{[78, 64, 89, 52, 71].map((v, i) => <div key={v} className="flex items-center gap-4"><span className="w-16 text-sm text-[#AAB4C5]">Zone {i + 1}</span><div className="h-3 flex-1 overflow-hidden rounded-full bg-white/8"><motion.div initial={{ width: 0 }} animate={{ width: `${v}%` }} transition={{ duration: 0.8, delay: i * 0.08 }} className="h-full rounded-full bg-[#3B82F6] shadow-[0_0_18px_rgba(59,130,246,0.7)]" /></div><span className="w-10 text-right text-sm font-bold text-white">{v}%</span></div>)}</div></div><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.2em] text-[#3B82F6]">Team performance</p><h3 className="mt-2 text-2xl font-black text-white">Field unit availability</h3><div className="mt-6 grid gap-3">{teams.map((t) => <div key={t.id} className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 p-4"><div><p className="font-bold text-white">{t.name}</p><p className="text-sm text-[#AAB4C5]">{t.members} members - ETA {t.eta}</p></div><span className="text-sm font-bold text-[#86EFAC]">{t.status}</span></div>)}</div></div></div>; }
+  function renderTeams() {
+    return (
+      <div className="grid gap-5 xl:grid-cols-[1fr_1fr]">
+        <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl">
+          <div className="mb-5 flex items-center justify-between">
+            <div><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Rescue fleet</p><h2 className="mt-2 text-2xl font-black text-white">All teams</h2></div>
+            <span className="rounded-full border border-[#3B82F6]/30 bg-[#3B82F6]/10 px-4 py-2 text-xs font-bold text-[#93C5FD]">{teams.length} total</span>
+          </div>
+          <div className="grid gap-3">
+            {teams.map((t) => (
+              <div key={t.id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="font-bold text-white">{t.name}</p>
+                    <p className="mt-1 text-sm text-[#AAB4C5]">{t.station} &middot; ETA {t.eta} &middot; {t.members} members</p>
+                  </div>
+                  <span className={cn("rounded-full border px-3 py-1 text-xs font-bold", t.status === "Available" ? "border-[#34C759]/30 bg-[#34C759]/10 text-[#86EFAC]" : "border-[#FFD60A]/30 bg-[#FFD60A]/10 text-[#FFE16A]")}>{t.status}</span>
+                </div>
+                <div className="mt-3 flex gap-2">
+                  <IconButton variant="gray" onClick={() => startEditTeam(t)} className="px-3 py-2 text-xs"><Activity className="h-3 w-3" /> Edit</IconButton>
+                  <IconButton variant="gray" onClick={() => deactivateTeam(Number(t.id))} className="px-3 py-2 text-xs"><X className="h-3 w-3" /> Deactivate</IconButton>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <form onSubmit={saveTeam} className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl h-fit">
+          <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">{editingTeamId ? "Edit team" : "New team"}</p>
+          <h2 className="mt-2 text-2xl font-black text-white">{editingTeamId ? "Update rescue team" : "Create rescue team"}</h2>
+          <div className="mt-6 grid gap-4">
+            <input value={teamForm.name} onChange={(e) => setTeamForm((c) => ({ ...c, name: e.target.value }))} placeholder="Team name (e.g. Alpha Unit)" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" required />
+            <input value={teamForm.station_name} onChange={(e) => setTeamForm((c) => ({ ...c, station_name: e.target.value }))} placeholder="Station name" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" required />
+            <input value={teamForm.contact_phone} onChange={(e) => setTeamForm((c) => ({ ...c, contact_phone: e.target.value }))} placeholder="Contact phone" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+            <div className="grid grid-cols-2 gap-4">
+              <select value={teamForm.status} onChange={(e) => setTeamForm((c) => ({ ...c, status: e.target.value }))} className="rounded-2xl border border-white/10 bg-[#16243A] px-4 py-3 text-white outline-none focus:border-[#3B82F6]/60">
+                <option value="available">Available</option>
+                <option value="assigned">Assigned</option>
+                <option value="busy">Busy</option>
+              </select>
+              <input value={teamForm.default_eta_minutes} onChange={(e) => setTeamForm((c) => ({ ...c, default_eta_minutes: e.target.value }))} placeholder="ETA (min)" type="number" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+            </div>
+            <div className="flex gap-3">
+              <IconButton type="submit" variant="blue" className="flex-1"><CheckCircle2 className="h-4 w-4" /> {editingTeamId ? "Update Team" : "Create Team"}</IconButton>
+              {editingTeamId ? <IconButton variant="gray" onClick={() => { setEditingTeamId(null); setTeamForm({ name: "", station_name: "", contact_phone: "", status: "available", default_eta_minutes: "" }); }}><X className="h-4 w-4" /> Cancel</IconButton> : null}
+            </div>
+          </div>
+        </form>
+      </div>
+    );
+  }
   function renderUsers() {
-    return <div className="grid gap-5 xl:grid-cols-[1fr_1fr]"><div className="grid gap-5 md:grid-cols-1">{([{ role: "Citizen", icon: <Users className="h-8 w-8 text-[#3B82F6]" />, copy: "Public emergency reporting, local alerts, shelters." }, { role: "Admin", icon: <Shield className="h-8 w-8 text-[#FF9500]" />, copy: "Incident approval, assignment, analytics, shelter registry." }, { role: "Rescue", icon: <Ambulance className="h-8 w-8 text-[#34C759]" />, copy: "Assigned missions, route navigation, status controls." }] as { role: string; icon: ReactNode; copy: string }[]).map((item) => <div key={item.role} className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl">{item.icon}<h3 className="mt-4 text-2xl font-black text-white">{item.role}</h3><p className="mt-3 leading-7 text-[#AAB4C5]">{item.copy}</p></div>)}</div><form onSubmit={createRescueUser} className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">User management</p><h2 className="mt-2 text-2xl font-black text-white">Create user</h2><div className="mt-6 grid gap-4"><input value={createUserForm.name} onChange={(e) => setCreateUserForm((c) => ({ ...c, name: e.target.value }))} placeholder="Full name" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={createUserForm.email} onChange={(e) => setCreateUserForm((c) => ({ ...c, email: e.target.value }))} placeholder="Email" type="email" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={createUserForm.phone} onChange={(e) => setCreateUserForm((c) => ({ ...c, phone: e.target.value }))} placeholder="Phone" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={createUserForm.password} onChange={(e) => setCreateUserForm((c) => ({ ...c, password: e.target.value }))} placeholder="Password" type="password" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><select value={createUserForm.role} onChange={(e) => setCreateUserForm((c) => ({ ...c, role: e.target.value }))} className="rounded-2xl border border-white/10 bg-[#16243A] px-4 py-3 text-white outline-none focus:border-[#3B82F6]/60"><option value="rescue">Rescue Team</option><option value="admin">Admin</option><option value="citizen">Citizen</option></select><IconButton type="submit" variant="green"><UserPlus className="h-4 w-4" /> Create User</IconButton></div></form></div>;
+    return (
+      <div className="grid gap-5 xl:grid-cols-[1fr_1fr]">
+        <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl">
+          <div className="mb-5 flex items-center justify-between">
+            <div><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">User directory</p><h2 className="mt-2 text-2xl font-black text-white">All users</h2></div>
+            <span className="rounded-full border border-[#3B82F6]/30 bg-[#3B82F6]/10 px-4 py-2 text-xs font-bold text-[#93C5FD]">{usersList.length} users</span>
+          </div>
+          <div className="mb-4 flex gap-3">
+            <input value={userSearch} onChange={(e) => setUserSearch(e.target.value)} placeholder="Search by name, email, phone..." className="flex-1 rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+            <IconButton variant="blue" onClick={() => fetchUsers(userSearch)}><Activity className="h-4 w-4" /> Search</IconButton>
+          </div>
+          <div className="grid gap-3 max-h-[620px] overflow-y-auto custom-scrollbar">
+            {usersList.map((u) => (
+              <div key={u.id} className={cn("rounded-2xl border p-4 transition", u.is_active ? "border-white/10 bg-white/5" : "border-[#FF3B30]/20 bg-[#FF3B30]/5 opacity-60")}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="font-bold text-white">{u.name}</p>
+                      <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-bold uppercase", u.roles.includes("admin") ? "bg-[#FF9500]/15 text-[#FFB340]" : u.roles.includes("rescue") ? "bg-[#34C759]/15 text-[#86EFAC]" : "bg-[#3B82F6]/15 text-[#93C5FD]")}>{u.roles.join(", ")}</span>
+                    </div>
+                    <p className="mt-1 truncate text-sm text-[#AAB4C5]">{u.email}</p>
+                    {u.phone ? <p className="text-xs text-[#6B7A90]">{u.phone}</p> : null}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className={cn("rounded-full px-2 py-1 text-[10px] font-bold", u.is_active ? "bg-[#34C759]/15 text-[#86EFAC]" : "bg-[#FF3B30]/15 text-[#FF8A83]")}>{u.is_active ? "Active" : "Inactive"}</span>
+                  </div>
+                </div>
+                <div className="mt-3 flex gap-2">
+                  <IconButton variant="gray" onClick={() => toggleUserActive(u.id, u.is_active)} className="px-3 py-2 text-xs">{u.is_active ? <><X className="h-3 w-3" /> Deactivate</> : <><CheckCircle2 className="h-3 w-3" /> Activate</>}</IconButton>
+                </div>
+              </div>
+            ))}
+            {usersList.length === 0 ? <div className="rounded-2xl border border-white/10 bg-white/5 p-5 text-center text-sm text-[#AAB4C5]">No users found. Create one using the form.</div> : null}
+          </div>
+        </div>
+        <form onSubmit={createRescueUser} className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl h-fit">
+          <p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">User management</p>
+          <h2 className="mt-2 text-2xl font-black text-white">Create user</h2>
+          <div className="mt-6 grid gap-4">
+            <input value={createUserForm.name} onChange={(e) => setCreateUserForm((c) => ({ ...c, name: e.target.value }))} placeholder="Full name" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" required />
+            <input value={createUserForm.email} onChange={(e) => setCreateUserForm((c) => ({ ...c, email: e.target.value }))} placeholder="Email" type="email" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" required />
+            <input value={createUserForm.phone} onChange={(e) => setCreateUserForm((c) => ({ ...c, phone: e.target.value }))} placeholder="Phone" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" />
+            <input value={createUserForm.password} onChange={(e) => setCreateUserForm((c) => ({ ...c, password: e.target.value }))} placeholder="Password" type="password" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" required />
+            <select value={createUserForm.role} onChange={(e) => setCreateUserForm((c) => ({ ...c, role: e.target.value }))} className="rounded-2xl border border-white/10 bg-[#16243A] px-4 py-3 text-white outline-none focus:border-[#3B82F6]/60">
+              <option value="rescue">Rescue Team</option>
+              <option value="admin">Admin</option>
+              <option value="citizen">Citizen</option>
+            </select>
+            {createUserForm.role === "rescue" ? <select value={createUserForm.rescue_team_id || teams[0]?.id || ""} onChange={(e) => setCreateUserForm((c) => ({ ...c, rescue_team_id: e.target.value }))} className="rounded-2xl border border-white/10 bg-[#16243A] px-4 py-3 text-white outline-none focus:border-[#3B82F6]/60">{teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select> : null}
+            <IconButton type="submit" variant="green"><UserPlus className="h-4 w-4" /> Create User</IconButton>
+          </div>
+        </form>
+      </div>
+    );
   }
   function renderAdmin() {
-    const sb = <><SidebarButton label="Dashboard" icon={<Activity className="h-4 w-4" />} active={adminTab === "dashboard"} onClick={() => setAdminTab("dashboard")} /><SidebarButton label="Active Incidents" icon={<Siren className="h-4 w-4" />} active={adminTab === "incidents"} onClick={() => setAdminTab("incidents")} /><SidebarButton label="Assign Teams" icon={<Ambulance className="h-4 w-4" />} active={adminTab === "assign"} onClick={() => setAdminTab("assign")} /><SidebarButton label="Analytics" icon={<BarChart3 className="h-4 w-4" />} active={adminTab === "analytics"} onClick={() => setAdminTab("analytics")} /><SidebarButton label="Shelters" icon={<Building2 className="h-4 w-4" />} active={adminTab === "shelters"} onClick={() => setAdminTab("shelters")} /><SidebarButton label="Users" icon={<Users className="h-4 w-4" />} active={adminTab === "users"} onClick={() => setAdminTab("users")} /></>;
-    return <OperationalShell title="Government Admin Command" subtitle="Approve, prioritize, assign rescue teams, and close cases." sidebar={sb} onExit={() => go("landing")} signalLabel="Admin mission control">{adminTab === "dashboard" ? renderAdminDashboard() : null}{adminTab === "incidents" ? renderAdminIncidents() : null}{adminTab === "assign" ? renderAssignTeams() : null}{adminTab === "analytics" ? renderAnalytics() : null}{adminTab === "shelters" ? renderShelterList(true) : null}{adminTab === "users" ? renderUsers() : null}{adminTab === "incidents" && selectedIncident ? renderIncidentDrawer() : null}</OperationalShell>;
+    const sb = <><SidebarButton label="Dashboard" icon={<Activity className="h-4 w-4" />} active={adminTab === "dashboard"} onClick={() => setAdminTab("dashboard")} /><SidebarButton label="Active Incidents" icon={<Siren className="h-4 w-4" />} active={adminTab === "incidents"} onClick={() => setAdminTab("incidents")} /><SidebarButton label="Assign Teams" icon={<Ambulance className="h-4 w-4" />} active={adminTab === "assign"} onClick={() => setAdminTab("assign")} /><SidebarButton label="Analytics" icon={<BarChart3 className="h-4 w-4" />} active={adminTab === "analytics"} onClick={() => setAdminTab("analytics")} /><SidebarButton label="Shelters" icon={<Building2 className="h-4 w-4" />} active={adminTab === "shelters"} onClick={() => setAdminTab("shelters")} /><SidebarButton label="Rescue Teams" icon={<Radio className="h-4 w-4" />} active={adminTab === "teams"} onClick={() => setAdminTab("teams")} /><SidebarButton label="Users" icon={<Users className="h-4 w-4" />} active={adminTab === "users"} onClick={() => { setAdminTab("users"); fetchUsers(); }} /></>;
+    return <OperationalShell title="Government Admin Command" subtitle="Approve, prioritize, assign rescue teams, and close cases." sidebar={sb} onExit={() => go("landing")} signalLabel="Admin mission control" onRefresh={handleManualRefresh} isRefreshing={isRefreshing} {...shellAuthProps}>{adminTab === "dashboard" ? renderAdminDashboard() : null}{adminTab === "incidents" ? renderAdminIncidents() : null}{adminTab === "assign" ? renderAssignTeams() : null}{adminTab === "analytics" ? renderAnalytics() : null}{adminTab === "shelters" ? renderShelterList(true) : null}{adminTab === "teams" ? renderTeams() : null}{adminTab === "users" ? renderUsers() : null}{adminTab === "incidents" && selectedIncident ? renderIncidentDrawer() : null}</OperationalShell>;
   }
 
   // ─── Render: Rescue ────────────────────────────────────────────────────
   function renderStatusControls(inc: Incident) { return <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Status control</p><h2 className="mt-2 text-2xl font-black text-white">Update mission</h2><div className="mt-6 grid gap-3">{rescueStatuses.map((s) => <button key={s} type="button" onClick={() => setIncidentStatus(inc, s)} className={cn("rounded-2xl border px-4 py-3 text-left font-bold transition", inc.status === s ? "border-[#3B82F6]/60 bg-[#3B82F6]/16 text-white" : "border-white/10 bg-white/5 text-[#AAB4C5] hover:border-[#3B82F6]/35 hover:text-white")}>{s}</button>)}</div></div>; }
   function renderRescue() {
-    const am = selectedIncident && selectedIncident.assignedTeamId ? selectedIncident : assignedMissions[0] ?? selectedIncident;
-    return <OperationalShell title="Rescue Team Tactical Panel" subtitle="Assigned missions, live navigation, and status controls." sidebar={null} onExit={() => go("landing")} signalLabel="Field operation channel"><div className="grid gap-5 xl:grid-cols-[390px_1fr]"><div className="grid gap-5"><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Assigned missions</p><h2 className="mt-2 text-2xl font-black text-white">Mission queue</h2><div className="mt-6 grid gap-3">{assignedMissions.length ? assignedMissions.map((inc) => <button key={inc.id} type="button" onClick={() => setSelectedIncident(inc)} className={cn("rounded-2xl border p-4 text-left transition", selectedIncident?.id === inc.id ? "border-[#3B82F6]/60 bg-[#3B82F6]/12" : "border-white/10 bg-white/5 hover:border-[#3B82F6]/35", inc.severity === "Critical" ? "emergency-pulse" : "")}><div className="flex items-start justify-between gap-3"><div><p className="font-bold text-white">{inc.id} - {inc.type}</p><p className="mt-1 text-sm text-[#AAB4C5]">{inc.location}</p></div><SeverityBadge severity={inc.severity} /></div><div className="mt-4 flex items-center justify-between gap-3"><StatusBadge status={inc.status} /><span className="text-xs text-[#6B7A90]">{inc.time}</span></div></button>) : <div className="rounded-2xl border border-white/10 bg-white/5 p-5 text-[#AAB4C5]">No active assigned missions.</div>}</div></div>{am ? renderStatusControls(am) : null}</div><div className="grid gap-5"><TacticalMap incidents={incidents} selectedIncident={am} onSelect={setSelectedIncident} className="min-h-[680px]" showRoute={Boolean(am)} title="Live navigation map" />{am ? <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Incident details</p><h2 className="mt-2 text-2xl font-black text-white">{am.type} at {am.location}</h2><p className="mt-3 max-w-3xl leading-7 text-[#AAB4C5]">{am.description}</p></div><div className="flex shrink-0 flex-col gap-2"><SeverityBadge severity={am.severity} /><StatusBadge status={am.status} /></div></div><div className="mt-5 flex flex-wrap gap-3 text-sm text-[#AAB4C5]"><span className="flex items-center gap-2"><PhoneCall className="h-4 w-4" />{am.citizen.phone || "N/A"}</span><span className="flex items-center gap-2"><Users className="h-4 w-4" />{am.citizen.name}</span></div></div> : null}</div></div></OperationalShell>;
+    const teamName = auth.user?.rescue_team?.name;
+    const rescueSubtitle = teamName
+      ? `${teamName} — assigned missions, live navigation, and status controls.`
+      : "No rescue team linked to this account. Contact an admin.";
+    const emptyMissionCopy = auth.user?.rescue_team
+      ? "No active assigned missions."
+      : "Link this account to a rescue team to receive missions.";
+    const am = assignedMissions.find((i) => i.id === selectedIncident?.id) ?? assignedMissions[0] ?? null;
+    return <OperationalShell title="Rescue Team Tactical Panel" subtitle={rescueSubtitle} sidebar={null} onExit={() => go("landing")} signalLabel="Field operation channel" onRefresh={handleManualRefresh} isRefreshing={isRefreshing} {...shellAuthProps}><div className="grid gap-5 xl:grid-cols-[390px_1fr]"><div className="grid gap-5"><div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Assigned missions</p><h2 className="mt-2 text-2xl font-black text-white">{teamName ?? "Mission queue"}</h2><div className="mt-6 grid gap-3">{assignedMissions.length ? assignedMissions.map((inc) => <button key={inc.id} type="button" onClick={() => setSelectedIncident(inc)} className={cn("rounded-2xl border p-4 text-left transition", selectedIncident?.id === inc.id ? "border-[#3B82F6]/60 bg-[#3B82F6]/12" : "border-white/10 bg-white/5 hover:border-[#3B82F6]/35", inc.severity === "Critical" ? "emergency-pulse" : "")}><div className="flex items-start justify-between gap-3"><div><p className="font-bold text-white">{inc.id} - {inc.type}</p><p className="mt-1 text-sm text-[#AAB4C5]">{inc.location}</p></div><SeverityBadge severity={inc.severity} /></div><div className="mt-4 flex items-center justify-between gap-3"><StatusBadge status={inc.status} /><span className="text-xs text-[#6B7A90]">{inc.time}</span></div></button>) : <div className="rounded-2xl border border-white/10 bg-white/5 p-5 text-[#AAB4C5]">{emptyMissionCopy}</div>}</div></div>{am ? renderStatusControls(am) : null}</div><div className="grid gap-5"><DisasterMap incidents={rescueMapIncidents} shelters={shelters} selectedIncident={am} onSelect={(inc) => setSelectedIncident(mapIncidentToFull(inc))} className="min-h-[680px]" showRoute={Boolean(am)} title="Live navigation map" />{am ? <div className="rounded-[2rem] border border-white/10 bg-[#111C2E]/76 p-6 backdrop-blur-2xl"><div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.22em] text-[#3B82F6]">Incident details</p><h2 className="mt-2 text-2xl font-black text-white">{am.type} at {am.location}</h2><p className="mt-3 max-w-3xl leading-7 text-[#AAB4C5]">{am.description}</p></div><div className="flex shrink-0 flex-col gap-2"><SeverityBadge severity={am.severity} /><StatusBadge status={am.status} /></div></div><div className="mt-5 flex flex-wrap gap-3 text-sm text-[#AAB4C5]"><span className="flex items-center gap-2"><PhoneCall className="h-4 w-4" />{am.citizen.phone || "N/A"}</span><span className="flex items-center gap-2"><Users className="h-4 w-4" />{am.citizen.name}</span></div></div> : null}</div></div></OperationalShell>;
   }
 
   // ─── Render: Public Map ──────────────────────────────────────────────
-  function renderPublicMap() { return <motion.div key="public-map" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen p-4 sm:p-6"><div className="mx-auto max-w-[1500px]"><header className="mb-5 flex flex-col gap-4 rounded-[2rem] border border-white/10 bg-[#111C2E]/70 p-5 backdrop-blur-2xl md:flex-row md:items-center md:justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.28em] text-[#3B82F6]">Public read-only view</p><h1 className="mt-2 text-4xl font-black text-white">Live Disaster Map</h1><p className="mt-2 text-[#AAB4C5]">Color-coded markers show severity and live status.</p></div><div className="flex flex-wrap gap-3"><IconButton variant="red" onClick={openReportFlow}><AlertTriangle className="h-4 w-4" /> Report Emergency</IconButton><IconButton variant="gray" onClick={() => go("landing")}><Home className="h-4 w-4" /> Home</IconButton></div></header><TacticalMap incidents={incidents} selectedIncident={selectedIncident} onSelect={setSelectedIncident} className="min-h-[calc(100vh-170px)]" title="Public live disaster map" /></div></motion.div>; }
+  function renderPublicMap() { return <motion.div key="public-map" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-screen p-4 sm:p-6"><div className="mx-auto max-w-[1500px]"><header className="mb-5 flex flex-col gap-4 rounded-[2rem] border border-white/10 bg-[#111C2E]/70 p-5 backdrop-blur-2xl md:flex-row md:items-center md:justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.28em] text-[#3B82F6]">Public read-only view</p><h1 className="mt-2 text-4xl font-black text-white">Live Disaster Map</h1><p className="mt-2 text-[#AAB4C5]">Color-coded markers show severity and live status.</p></div><div className="flex flex-wrap gap-3"><IconButton variant="red" onClick={openReportFlow}><AlertTriangle className="h-4 w-4" /> Report Emergency</IconButton><IconButton variant="gray" onClick={() => go("landing")}><Home className="h-4 w-4" /> Home</IconButton>{auth.isAuthenticated ? <IconButton variant="gray" onClick={handleLogout}><LogOut className="h-4 w-4" /> Logout</IconButton> : null}</div></header><DisasterMap incidents={incidents} shelters={shelters} selectedIncident={selectedIncident} onSelect={(inc) => setSelectedIncident(mapIncidentToFull(inc))} className="min-h-[calc(100vh-170px)]" title="Public live disaster map" /></div></motion.div>; }
 
   // ─── Modals ────────────────────────────────────────────────────────────
   function renderLoginModal() {
-    return <motion.div key="login-modal" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 grid place-items-center bg-[#020712]/70 p-4 backdrop-blur-xl"><motion.form initial={{ y: 30, scale: 0.96 }} animate={{ y: 0, scale: 1 }} exit={{ y: 30, scale: 0.96 }} onSubmit={submitLogin} className="w-full max-w-md rounded-[2rem] border border-white/10 bg-[#111C2E]/92 p-6 shadow-2xl"><div className="mb-6 flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.24em] text-[#3B82F6]">Secure access</p><h2 className="mt-2 text-3xl font-black text-white">Login</h2></div><button type="button" onClick={() => setLoginOpen(false)} className="rounded-full border border-white/10 bg-white/8 p-2 text-[#AAB4C5] transition hover:text-white"><X className="h-5 w-5" /></button></div><div className="grid gap-4"><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Email</span><div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/6 px-4 py-3 focus-within:border-[#3B82F6]/60"><Mail className="h-4 w-4 text-[#6B7A90]" /><input type="email" value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} placeholder="you@safelanka.lk" className="min-w-0 flex-1 bg-transparent text-white outline-none" /></div></label><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Password</span><div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/6 px-4 py-3 focus-within:border-[#3B82F6]/60"><Lock className="h-4 w-4 text-[#6B7A90]" /><input type="password" value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)} placeholder="Your password" className="min-w-0 flex-1 bg-transparent text-white outline-none" /></div></label><IconButton type="submit" variant="blue" className="mt-2 py-4"><Shield className="h-5 w-5" /> Login</IconButton><p className="text-center text-sm text-[#AAB4C5]">New here? <button type="button" onClick={() => { setLoginOpen(false); setRegisterOpen(true); }} className="font-bold text-[#3B82F6] hover:underline">Register as citizen</button></p></div></motion.form></motion.div>;
+    return <motion.div key="login-modal" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 grid place-items-center bg-[#020712]/70 p-4 backdrop-blur-xl"><motion.form initial={{ y: 30, scale: 0.96 }} animate={{ y: 0, scale: 1 }} exit={{ y: 30, scale: 0.96 }} onSubmit={submitLogin} className="w-full max-w-md rounded-[2rem] border border-white/10 bg-[#111C2E]/92 p-6 shadow-2xl"><div className="mb-6 flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.24em] text-[#3B82F6]">Secure access</p><h2 className="mt-2 text-3xl font-black text-white">Login</h2></div><button type="button" onClick={() => { setLoginOpen(false); setLoginError(""); }} className="rounded-full border border-white/10 bg-white/8 p-2 text-[#AAB4C5] transition hover:text-white"><X className="h-5 w-5" /></button></div>{loginError ? <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="mb-4 flex items-start gap-3 rounded-2xl border border-[#FF3B30]/40 bg-[#2A1118]/90 p-4"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-[#FF3B30]" /><p className="flex-1 text-sm font-semibold leading-5 text-[#FFD2CF]">{loginError}</p><button type="button" onClick={() => setLoginError("")} className="shrink-0 rounded-full p-1 text-[#FF8A83] opacity-60 transition hover:opacity-100"><X className="h-3.5 w-3.5" /></button></motion.div> : null}<div className="grid gap-4"><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Email</span><div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/6 px-4 py-3 focus-within:border-[#3B82F6]/60"><Mail className="h-4 w-4 text-[#6B7A90]" /><input type="email" value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} placeholder="you@safelanka.lk" className="min-w-0 flex-1 bg-transparent text-white outline-none" /></div></label><label className="grid gap-2"><span className="text-sm font-semibold text-[#AAB4C5]">Password</span><div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/6 px-4 py-3 focus-within:border-[#3B82F6]/60"><Lock className="h-4 w-4 text-[#6B7A90]" /><input type="password" value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)} placeholder="Your password" className="min-w-0 flex-1 bg-transparent text-white outline-none" /></div></label><IconButton type="submit" variant="blue" className="mt-2 py-4"><Shield className="h-5 w-5" /> Login</IconButton><p className="text-center text-sm text-[#AAB4C5]">New here? <button type="button" onClick={() => { setLoginOpen(false); setRegisterOpen(true); }} className="font-bold text-[#3B82F6] hover:underline">Register as citizen</button></p></div></motion.form></motion.div>;
   }
   function renderRegisterModal() {
-    return <motion.div key="register-modal" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 grid place-items-center bg-[#020712]/70 p-4 backdrop-blur-xl"><motion.form initial={{ y: 30, scale: 0.96 }} animate={{ y: 0, scale: 1 }} exit={{ y: 30, scale: 0.96 }} onSubmit={submitRegister} className="w-full max-w-md rounded-[2rem] border border-white/10 bg-[#111C2E]/92 p-6 shadow-2xl"><div className="mb-6 flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.24em] text-[#34C759]">Citizen registration</p><h2 className="mt-2 text-3xl font-black text-white">Create account</h2></div><button type="button" onClick={() => setRegisterOpen(false)} className="rounded-full border border-white/10 bg-white/8 p-2 text-[#AAB4C5] transition hover:text-white"><X className="h-5 w-5" /></button></div><div className="grid gap-4"><input value={regForm.name} onChange={(e) => setRegForm((c) => ({ ...c, name: e.target.value }))} placeholder="Full name" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={regForm.email} onChange={(e) => setRegForm((c) => ({ ...c, email: e.target.value }))} placeholder="Email" type="email" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={regForm.phone} onChange={(e) => setRegForm((c) => ({ ...c, phone: e.target.value }))} placeholder="Phone (optional)" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={regForm.password} onChange={(e) => setRegForm((c) => ({ ...c, password: e.target.value }))} placeholder="Password" type="password" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={regForm.password_confirmation} onChange={(e) => setRegForm((c) => ({ ...c, password_confirmation: e.target.value }))} placeholder="Confirm password" type="password" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><IconButton type="submit" variant="green" className="mt-2 py-4"><UserPlus className="h-5 w-5" /> Register</IconButton><p className="text-center text-sm text-[#AAB4C5]">Already have an account? <button type="button" onClick={() => { setRegisterOpen(false); setLoginOpen(true); }} className="font-bold text-[#3B82F6] hover:underline">Login</button></p></div></motion.form></motion.div>;
+    return <motion.div key="register-modal" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 grid place-items-center bg-[#020712]/70 p-4 backdrop-blur-xl"><motion.form initial={{ y: 30, scale: 0.96 }} animate={{ y: 0, scale: 1 }} exit={{ y: 30, scale: 0.96 }} onSubmit={submitRegister} className="w-full max-w-md rounded-[2rem] border border-white/10 bg-[#111C2E]/92 p-6 shadow-2xl"><div className="mb-6 flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-[0.24em] text-[#34C759]">Citizen registration</p><h2 className="mt-2 text-3xl font-black text-white">Create account</h2></div><button type="button" onClick={() => { setRegisterOpen(false); setRegisterError(""); }} className="rounded-full border border-white/10 bg-white/8 p-2 text-[#AAB4C5] transition hover:text-white"><X className="h-5 w-5" /></button></div>{registerError ? <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="mb-4 flex items-start gap-3 rounded-2xl border border-[#FF3B30]/40 bg-[#2A1118]/90 p-4"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-[#FF3B30]" /><p className="flex-1 text-sm font-semibold leading-5 text-[#FFD2CF]">{registerError}</p><button type="button" onClick={() => setRegisterError("")} className="shrink-0 rounded-full p-1 text-[#FF8A83] opacity-60 transition hover:opacity-100"><X className="h-3.5 w-3.5" /></button></motion.div> : null}<div className="grid gap-4"><input value={regForm.name} onChange={(e) => setRegForm((c) => ({ ...c, name: e.target.value }))} placeholder="Full name" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={regForm.email} onChange={(e) => setRegForm((c) => ({ ...c, email: e.target.value }))} placeholder="Email" type="email" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={regForm.phone} onChange={(e) => setRegForm((c) => ({ ...c, phone: e.target.value }))} placeholder="Phone (optional)" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={regForm.password} onChange={(e) => setRegForm((c) => ({ ...c, password: e.target.value }))} placeholder="Password" type="password" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><input value={regForm.password_confirmation} onChange={(e) => setRegForm((c) => ({ ...c, password_confirmation: e.target.value }))} placeholder="Confirm password" type="password" className="rounded-2xl border border-white/10 bg-white/6 px-4 py-3 text-white outline-none placeholder:text-[#6B7A90] focus:border-[#3B82F6]/60" /><IconButton type="submit" variant="green" className="mt-2 py-4"><UserPlus className="h-5 w-5" /> Register</IconButton><p className="text-center text-sm text-[#AAB4C5]">Already have an account? <button type="button" onClick={() => { setRegisterOpen(false); setLoginOpen(true); }} className="font-bold text-[#3B82F6] hover:underline">Login</button></p></div></motion.form></motion.div>;
   }
   function renderAssignModal() {
     if (!selectedIncident) return null;
@@ -489,10 +1116,27 @@ export default function App() {
   }
 
   // ─── Main Render ───────────────────────────────────────────────────────
+  if (auth.isInitializing) {
+    return (
+      <div className="grid min-h-screen place-items-center bg-[#0B1220] text-white">
+        <div className="flex flex-col items-center gap-4">
+          <span className="h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-[#3B82F6]" />
+          <p className="text-sm font-semibold text-[#AAB4C5]">Verifying session...</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#0B1220] text-white">
       <CommandBackdrop />
-      <Notifications notices={notices} />
+      {!isOnline && (
+        <div className="fixed top-0 left-0 right-0 z-[1000] bg-[#FF3B30] text-white py-2 px-4 text-center text-sm font-bold shadow-lg flex items-center justify-center gap-2 animate-pulse">
+          <AlertTriangle className="h-4 w-4" />
+          இணைய இணைப்பு துண்டிக்கப்பட்டுள்ளது. தற்காலிக ஆஃப்லைன் பயன்முறையில் உள்ளீர்கள். (Connection Lost. Operating in offline mode.)
+        </div>
+      )}
+      <Notifications notices={notices} onDismiss={dismissNotice} />
       <AnimatePresence mode="wait">
         {page === "landing" ? renderLanding() : null}
         {page === "citizen" ? <motion.div key="citizen">{renderCitizen()}</motion.div> : null}

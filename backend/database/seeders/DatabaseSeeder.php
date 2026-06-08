@@ -19,6 +19,7 @@ class DatabaseSeeder extends Seeder
             UserSeeder::class,
             IncidentTypeSeeder::class,
             RescueTeamSeeder::class,
+            RescueTeamMemberSeeder::class,
         ]);
     }
 }

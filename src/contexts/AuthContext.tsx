@@ -9,12 +9,14 @@ export interface AuthUser {
   is_active: boolean;
   roles: string[];
   permissions?: string[];
+  rescue_team?: { id: number; name: string } | null;
 }
 
-interface AuthContextType {
+export interface AuthContextType {
   user: AuthUser | null;
   token: string | null;
   isLoading: boolean;
+  isInitializing: boolean;
   isAuthenticated: boolean;
   role: string | null;
   login: (email: string, password: string) => Promise<AuthUser>;
@@ -41,6 +43,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(getInitialToken);
   const [user, setUser] = useState<AuthUser | null>(getInitialUser);
   const [isLoading, setIsLoading] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(() => Boolean(getInitialToken()));
 
   const isAuthenticated = Boolean(token && user);
   const role = useMemo(() => {
@@ -52,13 +55,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // On mount, verify token is still valid
   useEffect(() => {
-    if (!token) return;
-    authApi.me().catch(() => {
-      localStorage.removeItem("safe_lanka_token");
-      localStorage.removeItem("safe_lanka_user");
-      setToken(null);
-      setUser(null);
-    });
+    if (!token) {
+      setIsInitializing(false);
+      return;
+    }
+
+    authApi
+      .me()
+      .then((res) => {
+        const userData = res.data.data.user as AuthUser;
+        localStorage.setItem("safe_lanka_user", JSON.stringify(userData));
+        setUser(userData);
+      })
+      .catch((err: any) => {
+        // Only clear token if the response is explicitly 401 Unauthorized
+        if (err?.response?.status === 401) {
+          localStorage.removeItem("safe_lanka_token");
+          localStorage.removeItem("safe_lanka_user");
+          setToken(null);
+          setUser(null);
+        } else {
+          console.warn("SAFE Lanka: Session verification failed due to network or server error. Retaining local session.");
+        }
+      })
+      .finally(() => setIsInitializing(false));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const login = useCallback(async (email: string, password: string): Promise<AuthUser> => {
@@ -106,8 +126,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ user, token, isLoading, isAuthenticated, role, login, register, logout }),
-    [user, token, isLoading, isAuthenticated, role, login, register, logout],
+    () => ({ user, token, isLoading, isInitializing, isAuthenticated, role, login, register, logout }),
+    [user, token, isLoading, isInitializing, isAuthenticated, role, login, register, logout],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

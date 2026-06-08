@@ -18,7 +18,7 @@ class AuthController extends Controller
     {
         $user = User::query()
             ->where('email', strtolower((string) $request->string('email')))
-            ->with('roles')
+            ->with(['roles', 'rescueTeamMember.rescueTeam'])
             ->first();
 
         if (! $user || ! Hash::check((string) $request->string('password'), $user->password)) {
@@ -76,7 +76,7 @@ class AuthController extends Controller
     {
         /** @var User $user */
         $user = $request->user();
-        $user->loadMissing('roles');
+        $user->loadMissing(['roles', 'rescueTeamMember.rescueTeam']);
 
         return ApiResponse::success([
             'user' => $this->authUserPayload($user),
@@ -99,7 +99,7 @@ class AuthController extends Controller
      */
     private function authUserPayload(User $user): array
     {
-        return [
+        $payload = [
             'id' => $user->id,
             'name' => $user->name,
             'email' => $user->email,
@@ -109,5 +109,15 @@ class AuthController extends Controller
             'roles' => $user->getRoleNames(),
             'permissions' => $user->getPermissionNames(),
         ];
+
+        if ($user->hasRole('rescue')) {
+            $membership = $user->rescueTeamMember;
+            $payload['rescue_team'] = $membership ? [
+                'id' => $membership->rescue_team_id,
+                'name' => $membership->rescueTeam?->name,
+            ] : null;
+        }
+
+        return $payload;
     }
 }

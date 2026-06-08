@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Incident;
 use App\Models\IncidentAssignment;
 use App\Models\IncidentStatusHistory;
+use App\Support\IncidentBroadcaster;
 use Illuminate\Support\Facades\DB;
 
 class IncidentService
@@ -29,6 +30,8 @@ class IncidentService
                 'note' => 'Incident created.',
                 'changed_by_user_id' => $actorUserId,
             ]);
+
+            IncidentBroadcaster::dispatch($incident, 'created');
 
             return $incident;
         });
@@ -61,7 +64,10 @@ class IncidentService
                 'changed_by_user_id' => $actorUserId,
             ]);
 
-            return $incident->fresh();
+            $incident = $incident->fresh();
+            IncidentBroadcaster::dispatch($incident, 'assigned');
+
+            return $incident;
         });
     }
 
@@ -89,7 +95,10 @@ class IncidentService
                 'changed_by_user_id' => $actorUserId,
             ]);
 
-            return $incident->fresh();
+            $incident = $incident->fresh();
+            IncidentBroadcaster::dispatch($incident, 'status_changed');
+
+            return $incident;
         });
     }
 

@@ -16,6 +16,7 @@ Route::prefix('v1')->group(function (): void {
     ], 'Safe Lanka API is healthy.'));
 
     Route::get('/stats', [StatsController::class, 'index']);
+    Route::get('/public/incidents', [IncidentController::class, 'publicIndex']);
 
     Route::prefix('auth')->group(function (): void {
         Route::post('/login', [AuthController::class, 'login']);
@@ -27,6 +28,7 @@ Route::prefix('v1')->group(function (): void {
     });
 
     Route::middleware(['auth:sanctum', 'role:admin'])->prefix('admin')->group(function (): void {
+        // Incidents
         Route::get('/incidents', [IncidentController::class, 'index']);
         Route::get('/incidents/{incident}', [IncidentController::class, 'show']);
         Route::post('/incidents', [IncidentController::class, 'store']);
@@ -34,7 +36,21 @@ Route::prefix('v1')->group(function (): void {
         Route::post('/incidents/{incident}/assign', [IncidentController::class, 'assign']);
         Route::post('/incidents/{incident}/status', [IncidentController::class, 'updateStatus']);
         Route::post('/incidents/{incident}/media', [IncidentController::class, 'uploadMedia']);
+
+        // Users
+        Route::get('/users', [UserController::class, 'index']);
         Route::post('/users', [UserController::class, 'store']);
+        Route::patch('/users/{user}', [UserController::class, 'update']);
+        Route::delete('/users/{user}', [UserController::class, 'destroy']);
+
+        // Rescue Teams
+        Route::get('/rescue-teams', [RescueTeamController::class, 'index']);
+        Route::post('/rescue-teams', [RescueTeamController::class, 'store']);
+        Route::get('/rescue-teams/{rescueTeam}', [RescueTeamController::class, 'show']);
+        Route::patch('/rescue-teams/{rescueTeam}', [RescueTeamController::class, 'update']);
+        Route::delete('/rescue-teams/{rescueTeam}', [RescueTeamController::class, 'destroy']);
+
+        // Shelters
         Route::post('/shelters', [ShelterController::class, 'store']);
         Route::put('/shelters/{shelter}', [ShelterController::class, 'update']);
         Route::delete('/shelters/{shelter}', [ShelterController::class, 'destroy']);

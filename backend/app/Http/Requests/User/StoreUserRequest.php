@@ -22,6 +22,7 @@ class StoreUserRequest extends FormRequest
             'phone' => ['nullable', 'string', 'max:30'],
             'password' => ['required', 'string', 'min:6'],
             'role' => ['required', 'string', 'in:admin,rescue,citizen'],
+            'rescue_team_id' => ['required_if:role,rescue', 'nullable', 'integer', 'exists:rescue_teams,id'],
         ];
     }
 }

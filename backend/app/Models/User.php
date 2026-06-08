@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Attributes\Hidden;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use Laravel\Sanctum\HasApiTokens;
@@ -60,5 +61,22 @@ class User extends Authenticatable
     public function hasRole(string ...$roles): bool
     {
         return count(array_intersect($this->getRoleNames(), $roles)) > 0;
+    }
+
+    public function rescueTeamMember(): HasOne
+    {
+        return $this->hasOne(RescueTeamMember::class)->where('is_active', true);
+    }
+
+    public function getRescueTeamId(): ?int
+    {
+        if ($this->relationLoaded('rescueTeamMember')) {
+            return $this->rescueTeamMember?->rescue_team_id;
+        }
+
+        return RescueTeamMember::query()
+            ->where('user_id', $this->id)
+            ->where('is_active', true)
+            ->value('rescue_team_id');
     }
 }

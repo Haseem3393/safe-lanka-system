@@ -1,7 +1,7 @@
 import axios from "axios";
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL ?? "/api/v1",
+  baseURL: import.meta.env.VITE_API_URL || "http://localhost:8000/api/v1",
   headers: { "Content-Type": "application/json", Accept: "application/json" },
 });
 
@@ -48,6 +48,9 @@ export const authApi = {
 
 // ─── Incidents ───────────────────────────────────────────────────────────
 export const incidentApi = {
+  listPublic: (params?: Record<string, unknown>) =>
+    api.get("/public/incidents", { params }),
+
   list: (params?: Record<string, unknown>) => {
     const user = getStoredUser();
     const prefix = getRolePrefix(user?.roles);
@@ -96,6 +99,24 @@ export const incidentApi = {
 // ─── Rescue Teams ────────────────────────────────────────────────────────
 export const rescueTeamApi = {
   list: (status?: string) => api.get("/rescue-teams", { params: status ? { status } : {} }),
+
+  // Admin CRUD
+  adminList: (includeInactive = false) =>
+    api.get("/admin/rescue-teams", { params: includeInactive ? { include_inactive: true } : {} }),
+
+  show: (id: number) => api.get(`/admin/rescue-teams/${id}`),
+
+  create: (data: {
+    name: string;
+    station_name: string;
+    contact_phone?: string;
+    status?: string;
+    default_eta_minutes?: number;
+  }) => api.post("/admin/rescue-teams", data),
+
+  update: (id: number, data: Record<string, unknown>) => api.patch(`/admin/rescue-teams/${id}`, data),
+
+  destroy: (id: number) => api.delete(`/admin/rescue-teams/${id}`),
 };
 
 // ─── Rescue Team Members ─────────────────────────────────────────────────
@@ -132,8 +153,27 @@ export const statsApi = {
 
 // ─── Users (admin) ───────────────────────────────────────────────────────
 export const userApi = {
-  create: (data: { name: string; email: string; phone?: string; password: string; role: string }) =>
-    api.post("/admin/users", data),
+  list: (params?: { search?: string; role?: string; per_page?: number }) =>
+    api.get("/admin/users", { params }),
+
+  create: (data: {
+    name: string;
+    email: string;
+    phone?: string;
+    password: string;
+    role: string;
+    rescue_team_id?: number;
+  }) => api.post("/admin/users", data),
+
+  update: (id: number, data: {
+    name?: string;
+    email?: string;
+    phone?: string;
+    is_active?: boolean;
+    role?: string;
+  }) => api.patch(`/admin/users/${id}`, data),
+
+  destroy: (id: number) => api.delete(`/admin/users/${id}`),
 };
 
 // ─── Incident Types ──────────────────────────────────────────────────────

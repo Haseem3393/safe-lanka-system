@@ -9,10 +9,13 @@ use App\Http\Requests\Incident\StoreIncidentRequest;
 use App\Http\Requests\Incident\UpdateIncidentRequest;
 use App\Http\Requests\Incident\UpdateIncidentStatusRequest;
 use App\Http\Resources\IncidentResource;
+use App\Http\Resources\PublicIncidentResource;
 use App\Models\Incident;
 use App\Models\IncidentMedia;
+use App\Models\User;
 use App\Services\IncidentService;
 use App\Support\ApiResponse;
+use App\Support\IncidentBroadcaster;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -46,6 +49,32 @@ class IncidentController extends Controller
         ], 'Incidents fetched.');
     }
 
+    public function publicIndex(IncidentIndexRequest $request): JsonResponse
+    {
+        $query = Incident::query()
+            ->with(['incidentType'])
+            ->latest();
+
+        if (! $request->boolean('include_resolved')) {
+            $query->whereNotIn('status', ['resolved', 'completed']);
+        }
+
+        $this->applyFilters($query, $request->validated());
+
+        $perPage = (int) $request->input('per_page', 50);
+        $paginator = $query->paginate($perPage)->withQueryString();
+
+        return ApiResponse::success([
+            'items' => PublicIncidentResource::collection($paginator->items()),
+            'pagination' => [
+                'current_page' => $paginator->currentPage(),
+                'per_page' => $paginator->perPage(),
+                'total' => $paginator->total(),
+                'last_page' => $paginator->lastPage(),
+            ],
+        ], 'Public incidents fetched.');
+    }
+
     public function show(Incident $incident): JsonResponse
     {
         $user = request()->user();
@@ -55,8 +84,8 @@ class IncidentController extends Controller
             return ApiResponse::error('Forbidden.', [], 403);
         }
 
-        if (in_array('rescue', $roles, true) && $incident->assigned_team_id === null) {
-            return ApiResponse::error('Forbidden.', [], 403);
+        if ($denied = $this->denyUnlessRescueTeamOwnsIncident($user, $incident)) {
+            return $denied;
         }
 
         $incident->load(['incidentType', 'reporter', 'assignedTeam', 'statusHistory.changedBy', 'assignments.rescueTeam']);
@@ -89,6 +118,7 @@ class IncidentController extends Controller
     {
         $incident->fill($request->validated())->save();
         $incident->load(['incidentType', 'reporter', 'assignedTeam']);
+        IncidentBroadcaster::dispatch($incident, 'updated');
 
         return ApiResponse::success([
             'incident' => new IncidentResource($incident),
@@ -112,6 +142,10 @@ class IncidentController extends Controller
 
     public function updateStatus(UpdateIncidentStatusRequest $request, Incident $incident): JsonResponse
     {
+        if ($denied = $this->denyUnlessRescueTeamOwnsIncident($request->user(), $incident)) {
+            return $denied;
+        }
+
         $incident = $this->incidentService->updateStatus(
             $incident,
             (string) $request->string('status'),
@@ -185,8 +219,29 @@ class IncidentController extends Controller
             return;
         }
 
-        if (in_array('rescue', $roles, true)) {
-            $query->whereNotNull('assigned_team_id');
+        if (in_array('rescue', $roles, true) && $userId) {
+            $teamId = User::query()->find($userId)?->getRescueTeamId();
+
+            if ($teamId) {
+                $query->where('assigned_team_id', $teamId);
+            } else {
+                $query->whereRaw('1 = 0');
+            }
         }
+    }
+
+    private function denyUnlessRescueTeamOwnsIncident(?User $user, Incident $incident): ?JsonResponse
+    {
+        if (! $user?->hasRole('rescue')) {
+            return null;
+        }
+
+        $teamId = $user->getRescueTeamId();
+
+        if (! $teamId || $incident->assigned_team_id !== $teamId) {
+            return ApiResponse::error('Forbidden.', [], 403);
+        }
+
+        return null;
     }
 }

@@ -150,6 +150,47 @@ button {
   }
 }
 
+@keyframes pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.35;
+  }
+
+  50% {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+}
+
+.leaflet-container {
+  font-family: inherit;
+  background: #07101e;
+}
+
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: #111c2e;
+  color: #e5e7eb;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.leaflet-popup-content {
+  margin: 12px 14px;
+}
+
+.leaflet-control-attribution {
+  background: rgba(11, 18, 32, 0.72) !important;
+  color: #aab4c5 !important;
+  border-radius: 9999px;
+  padding: 2px 8px !important;
+}
+
+.leaflet-control-attribution a {
+  color: #93c5fd !important;
+}
+
 @keyframes emergency-pulse {
   0%,
   100% {
